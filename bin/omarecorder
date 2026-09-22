@@ -1,0 +1,2493 @@
+#!/usr/bin/env bash
+# omarecorder: record conversations and meetings, keep the audio, transcribe
+# them locally later with voxtype. This CLI is the only place logic lives; the
+# Omarchy shell plugin (Panel.qml / Library.qml / Service.qml) is a thin view
+# over it and reacts to $XDG_RUNTIME_DIR/omarecorder/state.json.
+#
+# Usage: omarecorder <command> [args]   (run `omarecorder help` for the list)
+set -euo pipefail
+umask 077   # recordings, transcripts, state: readable by this user only
+
+command -v jq >/dev/null 2>&1 || { echo "omarecorder: jq is required (install the jq package)" >&2; exit 1; }
+PLUGIN_ID="io.github.huey-holdings-llc.omarecorder"
+SELF="$(readlink -f "$0")"
+PLUGIN_DIR="$(dirname "$(dirname "$SELF")")"
+VERSION=$(jq -r '.version // "0"' "$PLUGIN_DIR/manifest.json" 2>/dev/null || echo 0)
+
+# ---------------------------------------------------------------- paths -----
+XDG_CONFIG_HOME="${XDG_CONFIG_HOME:-$HOME/.config}"
+XDG_STATE_HOME="${XDG_STATE_HOME:-$HOME/.local/state}"
+# Runtime state lives in the per-user runtime dir only: never /tmp, where
+# another local user could pre-create the directory and feed us pids/paths.
+if [[ -z "${XDG_RUNTIME_DIR:-}" ]]; then
+  if [[ -d "/run/user/$(id -u)" ]]; then XDG_RUNTIME_DIR="/run/user/$(id -u)"
+  else echo "omarecorder: XDG_RUNTIME_DIR is not set and /run/user/$(id -u) does not exist" >&2; exit 1; fi
+fi
+CONFIG_DIR="$XDG_CONFIG_HOME/omarecorder"
+CONFIG_FILE="$CONFIG_DIR/config.json"
+DICT_FILE="$CONFIG_DIR/dictionary"
+STATE_DIR="$XDG_STATE_HOME/omarecorder"
+BENCH_FILE="$STATE_DIR/bench.json"
+LOG_FILE="$STATE_DIR/omarecorder.log"
+# OMARECORDER_RUN_DIR: test hook only: lets the suite keep the real XDG_RUNTIME_DIR (so systemd --user
+# is reachable) while state stays in a sandbox.
+RUN_DIR="${OMARECORDER_RUN_DIR:-$XDG_RUNTIME_DIR/omarecorder}"
+STATE_FILE="$RUN_DIR/state.json"
+PLAY_PID_FILE="$RUN_DIR/play.pid"
+STATE_LOCK="$RUN_DIR/state.lock"
+LEVEL_FILE="$RUN_DIR/level"      # live input level while recording (see _meter)
+VOXTYPE_MODELS_DIR="${VOXTYPE_MODELS_DIR:-$HOME/.local/share/voxtype/models}"
+
+RATE=16000
+# Waveform strip pixel size. Wide enough that the Library never upscales it,
+# even on a wide window at 2x display scale; the PNG stays a few tens of KB.
+WAVE_W=2400
+WAVE_H=128
+# Long takes are transcribed in pieces of at most this many seconds (whisper
+# drifts into repetition loops on very long inputs; the transcript also fills
+# in piece by piece). Equal pieces, seams snapped to silence: see plan_chunks.
+CHUNK_S="${OMARECORDER_CHUNK_S:-1800}"
+[[ "$CHUNK_S" =~ ^[1-9][0-9]*$ ]] || CHUNK_S=1800   # a bad value must not reach bash arithmetic
+# A recording at least this old asks for a second stop within 10 s (0 disables).
+STOP_CONFIRM_S="${OMARECORDER_STOP_CONFIRM_S:-3600}"
+[[ "$STOP_CONFIRM_S" =~ ^[0-9]+$ ]] || STOP_CONFIRM_S=3600
+
+# The three presets OmaRecorder offers (voxtype can download more, but three
+# clear choices beat a list of eight). size_mb from ggml file sizes; rtf =
+# default realtime factor (audio seconds per wall second), replaced by
+# measured values in bench.json after the first run on this machine.
+MODEL_CATALOG='[
+  {"name":"base.en","size_mb":142,"rtf":10,"label":"Fast"},
+  {"name":"small.en","size_mb":466,"rtf":4,"label":"Balanced"},
+  {"name":"small","size_mb":466,"rtf":2,"label":"Multilingual"},
+  {"name":"large-v3-turbo","size_mb":1600,"rtf":3,"label":"Accurate"}
+]'
+
+# -------------------------------------------------------------- helpers -----
+die() { echo "omarecorder: $*" >&2; exit 1; }
+log() {
+  mkdir -p "$STATE_DIR"
+  # One rotation keeps the log bounded (whisper never writes here; see _tx_worker).
+  if [[ -f "$LOG_FILE" ]] && (( $(stat -c %s "$LOG_FILE" 2>/dev/null || echo 0) > 1000000 )); then mv -f "$LOG_FILE" "$LOG_FILE.1"; fi
+  printf '%s %s\n' "$(date +%FT%T)" "$*" >> "$LOG_FILE"
+}
+have() { command -v "$1" >/dev/null 2>&1; }
+now_iso() { date +%FT%T%z; }
+now_epoch() { date +%s; }
+
+notify() { # notify <headline> [description] [-- exec args...]
+  [[ "${OMARECORDER_QUIET:-0}" == "1" ]] && return 0
+  local head="$1" desc="${2:-}"; shift; if [[ $# -gt 0 ]]; then shift; fi
+  # The daemon reads the body as markup (the headline is plain text), so a
+  # title like "Q&A <draft>" broke it. The replacements are quoted: bash 5.2
+  # reads a bare & in one as "the matched text".
+  desc=${desc//&/"&amp;"}; desc=${desc//</"&lt;"}; desc=${desc//>/"&gt;"}
+  # omarchy-notification-send reads an argument starting --image=, --urgency=
+  # and the like as an option, even in the body's slot. An invisible word
+  # joiner in front keeps a title like that as text.
+  [[ "$head" == -* ]] && head=$'\xe2\x81\xa0'"$head"
+  [[ "$desc" == -* ]] && desc=$'\xe2\x81\xa0'"$desc"
+  local -a extra=()
+  if [[ "${1:-}" == "--" ]]; then shift; extra=(--exec "$@"); fi
+  if have omarchy-notification-send; then
+    omarchy-notification-send --app-name OmaRecorder -g "󰑊" -t 8000 "$head" "$desc" "${extra[@]}" 2>/dev/null || true
+  elif have notify-send; then
+    notify-send -a OmaRecorder -t 8000 "$head" "$desc" 2>/dev/null || true
+  fi
+}
+
+# need_val <flag> [value...]: a flag that takes a value must be given one.
+# Called as `need_val "$@"` from inside the case arm, so $# counts what is left.
+# Without it a missing value trips "unbound variable" under set -u, which is
+# bash's error message rather than ours. An empty value is still allowed: it is
+# meaningful for --title.
+need_val() { (( $# >= 2 )) || die "$1 needs a value"; }
+# want_json [args...]: true for --json, false for no argument. Anything else is
+# a typo, and a typo must not quietly hand human text to something parsing JSON.
+want_json() { case "${1:-}" in --json) return 0 ;; "") return 1 ;; *) die "unknown option: $1" ;; esac; }
+
+fmt_hms() { local s=${1%.*}; s=${s:-0}; printf '%02d:%02d:%02d' $((s / 3600)) $((s % 3600 / 60)) $((s % 60)); }
+
+# Atomic JSON write: write_json <file> <json>. An empty document is refused:
+# a jq filter that failed must never blank meta.json or state.json.
+write_json() {
+  [[ -n "$2" ]] || { log "write_json: refusing to write empty JSON to $1"; return 1; }
+  mkdir -p "$(dirname "$1")"; printf '%s\n' "$2" > "$1.tmp.$$"; mv -f "$1.tmp.$$" "$1"
+}
+# Seconds as given on the command line: non-negative, plain decimal, nothing else.
+valid_seconds() { [[ "$1" =~ ^[0-9]+([.][0-9]+)?$ ]]; }
+# strip_header <transcript.md>: the text without the first-line "<!-- omarecorder ... -->" comment
+strip_header() { sed '1{/^<!--/d}' "$1"; }
+
+# ---------------------------------------------------------------- config ----
+CONFIG_DEFAULTS=$(jq -cn --arg dir "${OMARECORDER_DIR:-$HOME/Recordings}" '{
+  recordingsDir: $dir, defaultSource: "mic", defaultModel: "base.en",
+  language: "en", keepAwake: true, threads: 0, autoTranscribe: false,
+  enhanceAudio: false, obsidianVault: "", exportDir: "" }')   # "" = automatic (see resolve_export_target)
+
+load_config() {
+  local file='{}'
+  [[ -f "$CONFIG_FILE" ]] && file=$(jq -c . "$CONFIG_FILE" 2>/dev/null || echo '{}')
+  CONFIG=$(jq -cn --argjson d "$CONFIG_DEFAULTS" --argjson f "$file" '$d + $f')
+  # OMARECORDER_DIR env always wins (tests, one-off runs)
+  if [[ -n "${OMARECORDER_DIR:-}" ]]; then
+    CONFIG=$(jq -c --arg dir "$OMARECORDER_DIR" '.recordingsDir = $dir' <<<"$CONFIG")
+  fi
+  ROOT=$(jq -r '.recordingsDir' <<<"$CONFIG"); ROOT="${ROOT/#\~/$HOME}"
+}
+cfg() { jq -r --arg k "$1" '.[$k]' <<<"$CONFIG"; }
+
+# Typed by key (a directory named "123" must stay a string), written under the
+# lock so two concurrent sets of different keys cannot lose one.
+_write_config() {
+  local key="$1" val="$2" cur='{}' j
+  [[ -f "$CONFIG_FILE" ]] && cur=$(jq -c . "$CONFIG_FILE")
+  case "$key" in
+    threads) j=$(jq -c --arg k "$key" --argjson v "$val" '.[$k]=$v' <<<"$cur") ;;
+    keepAwake|autoTranscribe|enhanceAudio) j=$(jq -c --arg k "$key" --argjson v "$val" '.[$k]=$v' <<<"$cur") ;;
+    *) j=$(jq -c --arg k "$key" --arg v "$val" '.[$k]=$v' <<<"$cur") ;;
+  esac
+  write_json "$CONFIG_FILE" "$j"
+}
+
+cmd_config() {
+  local sub="${1:-get}"; shift || true
+  case "$sub" in
+    get)
+      if [[ "${1:-}" == "--json" || -z "${1:-}" ]]; then jq . <<<"$CONFIG"
+      else jq -e --arg k "$1" 'has($k)' <<<"$CONFIG" >/dev/null || die "unknown config key: $1"; cfg "$1"; fi ;;
+    set)
+      local key="${1:-}" val="${2:-}"; [[ -n "$key" ]] || die "usage: config set <key> <value>"
+      # An empty value is only meaningful for the export targets ("" = automatic).
+      [[ -n "$val" || "$key" =~ ^(obsidianVault|exportDir)$ ]] || die "usage: config set <key> <value>"
+      case "$key" in
+        # Created if missing, as record and import would; only a path that
+        # cannot be a folder, or is not writable, is refused.
+        recordingsDir) local d="${val/#\~/$HOME}"
+          # Absolute only: a relative folder would land somewhere different for every caller.
+          [[ "$d" == /* ]] || die "recordingsDir must be an absolute path (or start with ~): $val"
+          mkdir -p -- "$d" 2>/dev/null || true
+          [[ -d "$d" && -w "$d" ]] || die "recordingsDir must be a writable folder (it could not be created): $val" ;;
+        obsidianVault) [[ -z "$val" || -d "${val/#\~/$HOME}" ]] || die "obsidianVault must be an existing directory (or \"\" for automatic): $val" ;;
+        defaultModel) model_known "$val" \
+          || die "unknown model: $val (see: omarecorder models)" ;;
+        language) [[ "$val" =~ ^(auto|[a-z][a-z])$ ]] || die "language must be auto or a two-letter code (en, de, fr)" ;;
+        exportDir) local ed="${val/#\~/$HOME}"
+          [[ -z "$val" || ! -e "$ed" || -d "$ed" ]] || die "exportDir is a file, not a directory: $val" ;;
+        defaultSource) [[ "$val" =~ ^(mic|system|both)$ ]] || die "defaultSource must be mic|system|both" ;;
+        keepAwake) [[ "$val" =~ ^(true|false)$ ]] || die "keepAwake must be true|false" ;;
+        autoTranscribe) [[ "$val" =~ ^(true|false)$ ]] || die "autoTranscribe must be true|false" ;;
+        enhanceAudio) [[ "$val" =~ ^(true|false)$ ]] || die "enhanceAudio must be true|false" ;;
+        threads) [[ "$val" =~ ^[0-9]+$ ]] || die "threads must be an integer" ;;
+        *) die "unknown config key: $key" ;;
+      esac
+      with_lock _write_config "$key" "$val"; load_config; bump_state; echo "$key=$val" ;;
+    *) die "usage: config get [key|--json] | config set <key> <value>" ;;
+  esac
+}
+
+# ----------------------------------------------------------------- state ----
+EMPTY_STATE='{"recording":null,"jobs":[],"version":0,"last_stop":null,"download_failed":null}'
+read_state() { # always normalized to {recording, jobs, version, last_stop, download_failed}
+  { [[ -f "$STATE_FILE" ]] && cat "$STATE_FILE" 2>/dev/null || echo "$EMPTY_STATE"; } \
+    | jq -c '{recording: (.recording // null), jobs: (.jobs // []), version: (.version // 0), last_stop: (.last_stop // null), download_failed: (.download_failed // null)}' 2>/dev/null || echo "$EMPTY_STATE"
+}
+# save_state <json>: bumps version and writes atomically (callers hold the lock)
+save_state() { write_json "$STATE_FILE" "$(jq -c '.version = ((.version // 0) + 1)' <<<"$1")"; }
+# Every read-modify-write of state.json runs under one flock so concurrent
+# CLI calls (UI actions, workers, keybindings) never lose each other's update.
+# If the lock cannot be taken the call fails; it never runs unlocked (two
+# read-modify-writes racing would lose one of them). Nothing holds the lock for
+# long: reconcile does its ffmpeg work outside it. OMARECORDER_LOCK_WAIT: tests.
+with_lock() {
+  mkdir -p "$RUN_DIR"
+  ( flock -w "${OMARECORDER_LOCK_WAIT:-30}" 9 || { log "state lock timeout: $*"; echo "omarecorder: timed out waiting for the state lock; another omarecorder is busy (details: $LOG_FILE)" >&2; exit 1; }; "$@" ) 9>>"$STATE_LOCK"
+}
+_bump_state() { save_state "$(read_state)"; }
+_state_set() { save_state "$(jq -c "$@" <<<"$(read_state)")"; }
+bump_state() { with_lock _bump_state; }
+# state_set [jq args...] <filter>: apply a jq filter to the state and save it
+state_set() { with_lock _state_set "$@"; }
+# Under the lock: refuse to write a second recording entry, or a second
+# transcribe job for the same id. The unlocked pre-checks in the commands are
+# only fast paths; these are the ones that count.
+_claim_recording() {
+  local st; st=$(read_state)
+  [[ $(jq -r '.recording != null' <<<"$st") == "true" ]] && return 1
+  save_state "$(jq -c "$@" <<<"$st")"
+}
+# The locked hand-over for record resume: null the offer AND reserve the
+# recording slot in one write, then print the offer. Only lands while the
+# offer still names this id, is still resumable and nothing is recording.
+# Holding the offer licenses touching the shared segment files, and the
+# reservation (pids = this process, starting = true) closes the window in
+# which a concurrent trim, rename, delete, transcribe or start could pass
+# require_idle and touch the take while its recorders are still spawning.
+# Reconcile sees the reservation as alive while this process lives, and
+# record stop refuses to take it (see _take_recording).
+_take_resume_offer() {
+  local id="$1" source="$2" dir="$3" st ls; st=$(read_state)
+  [[ $(jq -r '.recording != null' <<<"$st") == "true" ]] && return 1
+  # Not while the take is being changed (an edit claim) or transcribed.
+  [[ $(jq -r --arg id "$id" '.jobs[] | select(.id==$id)' <<<"$st") ]] && return 1
+  ls=$(jq -c --arg id "$id" '.last_stop | select(. != null and .id == $id and .resumable == true)' <<<"$st")
+  [[ -n "$ls" ]] || return 1
+  save_state "$(jq -c --arg id "$id" --arg source "$source" --arg dir "$dir" --argjson t "$(now_epoch)" --argjson sp "$$" \
+    '.last_stop = null
+     | .recording = {id:$id, source:$source, dir:$dir, started_at:$t, pids:[$sp], files:[], meter_pid:null, resume:true, starting:true}' <<<"$st")"
+  printf '%s\n' "$ls"
+}
+# The reservation becomes the real recording entry once the recorders run:
+# fill in the pids, files and meter. Only lands while the starting
+# reservation is still ours; anything else means the state was changed
+# underneath us and the caller cleans up instead of recording blind.
+_activate_resume() {
+  local id="$1"; shift
+  local st; st=$(read_state)
+  [[ $(jq -r --arg id "$id" '.recording != null and .recording.id == $id and .recording.starting == true' <<<"$st") == "true" ]] || return 1
+  save_state "$(jq -c "$@" <<<"$st")"
+}
+# Roll a failed resume start back in one locked write: drop the reservation
+# (only while it is still ours) and give the offer back, unless the world
+# moved on (a recording started, or a newer stop armed its own offer).
+_rollback_resume() {
+  local id="$1" st; st=$(read_state)
+  if [[ $(jq -r --arg id "$id" '.recording != null and .recording.id == $id and .recording.starting == true' <<<"$st") == "true" ]]; then
+    st=$(jq -c '.recording = null' <<<"$st")
+  fi
+  if [[ $(jq -r '.recording == null and .last_stop == null' <<<"$st") == "true" ]]; then
+    st=$(jq -c --argjson o "$2" '.last_stop = $o' <<<"$st")
+  fi
+  save_state "$st"
+}
+_claim_tx() {
+  local id="$1"; shift
+  local st; st=$(read_state)
+  # Any job on this take refuses: a second transcription, or an edit claim
+  # (rename, trim, note, delete) still running.
+  [[ $(jq -r --arg id "$id" '.jobs[] | select(.id==$id)' <<<"$st") ]] && return 1
+  save_state "$(jq -c "$@" <<<"$st")"
+}
+# Claim a download job, atomically. Fresh job appended: return 0. One already
+# running: a non-empty then_json re-aims its chained transcription (last press
+# wins, return 2, no new worker); an empty one returns 1 so plain
+# `model download` keeps refusing a duplicate. then stays a nested object:
+# download jobs must never grow a top-level id (cancel and the transcribe
+# rollback both filter jobs by .id).
+_claim_dl() {
+  local model="$1" then_json="$2" unit="$3" bytes="$4"
+  local st; st=$(read_state)
+  if [[ $(jq -r --arg m "$model" '.jobs[] | select(.type=="download" and .model==$m)' <<<"$st") ]]; then
+    [[ -n "$then_json" ]] || return 1
+    save_state "$(jq -c --arg m "$model" --argjson th "$then_json" \
+      '.jobs |= map(if .type=="download" and .model==$m then ."then"=$th else . end)' <<<"$st")"
+    return 2
+  fi
+  # A fresh attempt replaces this model's last failure (the Library shows it until then).
+  st=$(jq -c --arg m "$model" 'if .download_failed.model == $m then .download_failed = null else . end' <<<"$st")
+  if [[ -n "$then_json" ]]; then
+    save_state "$(jq -c --arg m "$model" --arg u "$unit" --argjson t "$(now_epoch)" --argjson b "$bytes" --argjson th "$then_json" \
+      '.jobs += [{type:"download", model:$m, unit:$u, started_at:$t, expected_bytes:$b, "then":$th}]' <<<"$st")"
+  else
+    save_state "$(jq -c --arg m "$model" --arg u "$unit" --argjson t "$(now_epoch)" --argjson b "$bytes" \
+      '.jobs += [{type:"download", model:$m, unit:$u, started_at:$t, expected_bytes:$b}]' <<<"$st")"
+  fi
+}
+# Print the download job's chained intent and remove the job, in one locked
+# step (the _take_recording shape): a transcribe --download re-aim can never
+# land between the read and the removal and get silently dropped.
+_take_dl_then() {
+  local m="$1" st; st=$(read_state)
+  jq -c --arg m "$m" '[.jobs[] | select(.type=="download" and .model==$m)][0]."then" // empty' <<<"$st"
+  save_state "$(jq -c --arg m "$m" '.jobs |= map(select(.type != "download" or .model != $m))' <<<"$st")"
+}
+# Print the recording entry and null it, atomically; fail if there is none.
+# A starting resume reservation (return 2) is never taken: it has no recorder
+# pids yet, and taking it would orphan the recorders being spawned. The
+# window is under a second, and a reservation whose process died is cleared
+# by reconcile instead.
+_take_recording() {
+  local st rec; st=$(read_state); rec=$(jq -c '.recording' <<<"$st")
+  [[ "$rec" == "null" ]] && return 1
+  [[ $(jq -r '.starting == true' <<<"$rec") == "true" ]] && return 2
+  save_state "$(jq -c '.recording = null' <<<"$st")"
+  printf '%s\n' "$rec"
+}
+
+# reconcile_state: drop dead recordings/jobs from the state (short, under the
+# lock), then repair whatever take was orphaned (ffmpeg passes, outside the lock).
+reconcile_state() {
+  local ddir; ddir=$(with_lock _reconcile_state)
+  [[ -n "$ddir" ]] && recover_take "$ddir"
+  sweep_orphans
+  return 0
+}
+
+# sweep_orphans: a folder with no meta.json is a crash leftover from the window
+# between mkdir and the meta write in record/import. The list skips it silently,
+# but it blocks that id forever. A folder younger than the guard is left alone
+# (a recording may be starting right now); one that holds any audio at all is
+# given a minimal meta.json and repaired like any other dead take (pw-record
+# starts before the meta write and is detached, so a crash there can leave
+# anything from seconds to minutes of good audio, and none of it is ours to
+# judge); only a husk with nothing beyond a WAV header is removed.
+sweep_orphans() {
+  local d now mt wav size s
+  [[ -d "$ROOT" ]] || return 0
+  now=$(now_epoch)
+  while IFS= read -r d; do
+    [[ -e "$d/meta.json" ]] && continue
+    # Only folders this CLI made (the marker from _claim_dir): the name
+    # pattern alone proves resemblance, and recordingsDir is a shared folder.
+    [[ -e "$d/.omarecorder" ]] || continue
+    mt=$(stat -c %Y "$d" 2>/dev/null) || continue
+    (( now - mt < 300 )) && continue
+    # The name pattern proves resemblance, not ownership: recordingsDir is a
+    # shared folder (~/Recordings by default). In the crash window the recorder
+    # has written nothing but its WAVs, so anything else in there means the
+    # folder is not ours; leave it alone.
+    local foreign=0 f
+    while IFS= read -r f; do
+      case "${f##*/}" in audio.wav|mic.wav|system.wav|.omarecorder) ;; *) foreign=1; break ;; esac
+    done < <(find "$d" -mindepth 1 2>/dev/null)
+    (( foreign )) && continue
+    size=0
+    for wav in "$d/audio.wav" "$d/mic.wav" "$d/system.wav"; do
+      [[ -f "$wav" ]] || continue
+      s=$(stat -c %s "$wav" 2>/dev/null || echo 0)
+      (( s > size )) && size=$s
+    done
+    if (( size > 44 )); then
+      local base id title
+      base=$(basename "$d"); id="${base:0:17}"; title=$(sanitize_title "${base:18}")
+      write_initial_meta "$d" "$id" "$title" "recovered" "$(date -d "@$mt" +%FT%T%z)"
+      # A "both" take that died with only one track: promote it, recover_take
+      # only mixes when both halves exist.
+      if [[ ! -f "$d/audio.wav" && -f "$d/mic.wav" && ! -f "$d/system.wav" ]]; then mv "$d/mic.wav" "$d/audio.wav"; fi
+      if [[ ! -f "$d/audio.wav" && -f "$d/system.wav" && ! -f "$d/mic.wav" ]]; then mv "$d/system.wav" "$d/audio.wav"; fi
+      log "sweep: salvaged orphan take $d"
+      recover_take "$d"
+    else
+      # Everything in here is proven: only the recorder's own wav names, none
+      # bigger than a bare header. Remove exactly those and rmdir the folder;
+      # rmdir refuses if anything else appeared meanwhile, so a recursive
+      # delete never runs against contents the recorder cannot account for.
+      rm -f "$d/audio.wav" "$d/mic.wav" "$d/system.wav" "$d/.omarecorder"
+      if rmdir "$d" 2>/dev/null; then log "sweep: removed orphan folder $d"; else log "sweep: left unexpectedly non-empty folder $d"; fi
+    fi
+  done < <(find "$ROOT" -mindepth 1 -maxdepth 1 -type d -name '????-??-??_??????*' 2>/dev/null)
+}
+
+pid_alive() { kill -0 "$1" 2>/dev/null; }
+# A recorder pid from state.json is only ours while it still is a recorder: pids
+# get recycled, and a stale one must never be signalled or read as a live take.
+recorder_alive() { pid_alive "$1" && [[ "$(cat "/proc/$1/comm" 2>/dev/null)" =~ ^(pw-record|pw-cat)$ ]]; }
+
+# oneshot units report "activating" while they run: treat that as alive.
+unit_active() { [[ "$(systemctl --user show -p ActiveState --value "$1" 2>/dev/null)" =~ ^(active|activating|reloading|deactivating)$ ]]; }
+
+# The locked half of reconcile: state only, no ffmpeg. Prints the folder of a
+# recording whose recorder died so the caller can repair it after the lock is gone.
+_reconcile_state() {
+  local st changed=0
+  st=$(read_state)
+  if [[ $(jq -r '.recording != null' <<<"$st") == "true" ]]; then
+    local alive=0 p
+    # A resume reservation holds this CLI's own pid while its recorders spawn.
+    local live=recorder_alive; [[ $(jq -r '.recording.starting == true' <<<"$st") == "true" ]] && live=pid_alive
+    for p in $(jq -r '.recording.pids[] | select(type=="number")' <<<"$st"); do "$live" "$p" && alive=1; done
+    if [[ $alive == 0 ]]; then
+      local ddir mpid; ddir=$(jq -r '.recording.dir // empty' <<<"$st"); mpid=$(jq -r '.recording.meter_pid // empty' <<<"$st")
+      stop_meter "$mpid"
+      st=$(jq -c '.recording=null' <<<"$st"); changed=1; log "reconcile: cleared dead recording"
+      [[ -n "$ddir" && -d "$ddir" ]] && printf '%s\n' "$ddir"
+    fi
+  fi
+  local keep='[]' j now; now=$(now_epoch)
+  while IFS= read -r j; do
+    [[ -z "$j" ]] && continue
+    local unit age; unit=$(jq -r '.unit // empty' <<<"$j"); age=$(( now - $(jq -r '.started_at // 0' <<<"$j") ))
+    # An edit claim lives exactly as long as the command that holds it.
+    # (pid 0 would pass kill -0, being our own process group, and lock the take for good.)
+    local epid; epid=$(jq -r '.pid // 0' <<<"$j")
+    if [[ $(jq -r '.type' <<<"$j") == "edit" ]] && { [[ ! "$epid" =~ ^[1-9][0-9]*$ ]] || ! pid_alive "$epid"; }; then
+      changed=1; log "reconcile: dropped the edit claim of a finished command"; continue
+    fi
+    # systemd-run --no-block: a unit sampled before it activates reads inactive; give it a moment
+    if [[ -n "$unit" ]] && (( age > 5 )) && ! unit_active "$unit"; then changed=1; log "reconcile: dropped finished job $unit"; continue; fi
+    keep=$(jq -c --argjson j "$j" '. + [$j]' <<<"$keep")
+  done < <(jq -c '.jobs[]' <<<"$st")
+  st=$(jq -c --argjson k "$keep" '.jobs=$k' <<<"$st")
+  [[ $changed == 1 ]] && save_state "$st"
+  return 0
+}
+
+# recover_take <dir>: a take whose recorder died (power loss, shell killed).
+# Repair the WAV header, mix a "both" take, measure it, tell the user. Runs
+# outside the state lock; only the final bump touches state.json.
+recover_take() {
+  local ddir="$1"
+  # A resume that died leaves the original take intact plus segment files;
+  # repair and join them the way a clean stop would (see recover_segments).
+  if [[ -f "$ddir/audio.seg.wav" || -f "$ddir/mic.seg.wav" || -f "$ddir/system.seg.wav" ]]; then
+    recover_segments "$ddir"
+  fi
+  # A "both" take that died before the mix has only mic.wav + system.wav.
+  if [[ ! -f "$ddir/audio.wav" && -f "$ddir/mic.wav" && -f "$ddir/system.wav" ]]; then
+    repair_wav "$ddir/mic.wav" || true; repair_wav "$ddir/system.wav" || true; mix_both "$ddir" || true
+  fi
+  [[ -f "$ddir/audio.wav" ]] || return 0
+  repair_wav "$ddir/audio.wav" || true; finalize_audio "$ddir"; analyze_levels "$ddir"
+  local rttl; rttl=$(jq -r '.title // empty' "$ddir/meta.json" 2>/dev/null || true); rttl="${rttl:-$(basename "$ddir")}"
+  notify "Recording recovered · $rttl" "The recorder stopped unexpectedly; $(fmt_hms "$(jq -r '.duration_s // 0' "$ddir/meta.json" 2>/dev/null || echo 0)") of audio was saved."
+  bump_state
+}
+
+# ------------------------------------------------------------ recordings ----
+new_id() { date +%Y-%m-%d_%H%M%S; }
+# Pick a free id and create its folder in one step, under the state lock: two
+# starts or imports in the same second must never share a folder, because a
+# failed one removes its folder. With a base epoch (import) the id counts up
+# from the file's time; without one (record start) it waits for the next second.
+# A folder just claimed and nothing in it but the marker: gone without a trace.
+drop_empty_dir() { rm -f "$1/.omarecorder"; rmdir "$1" 2>/dev/null || true; }
+_claim_dir() { # <title> [base_epoch] -> the new folder
+  local title="$1" base="${2:-}" n=0 id dir
+  if [[ -n "$base" ]]; then id=$(date -d "@$base" +%Y-%m-%d_%H%M%S); else id=$(new_id); fi
+  while rec_dir "$id" >/dev/null 2>&1; do
+    if [[ -n "$base" ]]; then n=$((n+1)); id=$(date -d "@$((base + n))" +%Y-%m-%d_%H%M%S); else sleep 1; id=$(new_id); fi
+  done
+  dir="$ROOT/$id"; [[ -n "$title" ]] && dir="$ROOT/$id $title"
+  # The marker says this CLI made the folder: the crash sweep touches nothing
+  # without it (an id-shaped folder of the user's is not ours to adopt or remove).
+  mkdir -p "$dir" && : > "$dir/.omarecorder" && printf '%s\n' "$dir"
+}
+id_valid() { [[ "$1" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}_[0-9]{6}$ ]]; }
+
+# rec_dir <id> → path (dir name is "<id>" or "<id> <title>")
+rec_dir() {
+  local id="$1" d
+  id_valid "$id" || die "invalid recording id: $id"
+  for d in "$ROOT/$id" "$ROOT/$id "*; do [[ -d "$d" ]] && { echo "$d"; return 0; }; done
+  return 1
+}
+require_dir() { rec_dir "$1" || die "no recording with id $1"; }
+# require_idle <id>: refuse while that recording is being recorded or transcribed
+require_idle() {
+  reconcile_state
+  local st; st=$(read_state)
+  [[ $(jq -r '.recording.id // empty' <<<"$st") == "$1" ]] && die "$1 is still recording; stop it first"
+  [[ $(jq -r --arg id "$1" '.jobs[] | select(.type=="transcribe" and .id==$id)' <<<"$st") ]] && die "transcription running for $1; wait for it or cancel it first"
+  [[ $(jq -r --arg id "$1" '.jobs[] | select(.type=="edit" and .id==$id)' <<<"$st") ]] && die "$1 is being changed by another command; try again in a moment"
+  return 0
+}
+# claim_edit <id>: the idle check and an "edit" job for this take in one
+# locked step, released when the command exits. rename, trim, note and delete
+# run under it, so a transcription or resume cannot start on the take while it
+# changes (the unlocked require_idle left that window open). Reconcile drops a
+# claim whose process has gone.
+_claim_edit() {
+  local id="$1" st; st=$(read_state)
+  [[ $(jq -r '.recording.id // empty' <<<"$st") == "$id" ]] && { echo "omarecorder: $id is still recording; stop it first" >&2; return 1; }
+  [[ $(jq -r --arg id "$id" '.jobs[] | select(.type=="transcribe" and .id==$id)' <<<"$st") ]] && { echo "omarecorder: transcription running for $id; wait for it or cancel it first" >&2; return 1; }
+  [[ $(jq -r --arg id "$id" '.jobs[] | select(.type=="edit" and .id==$id)' <<<"$st") ]] && { echo "omarecorder: $id is being changed by another command; try again in a moment" >&2; return 1; }
+  save_state "$(jq -c --arg id "$id" --argjson p "$$" --argjson t "$(now_epoch)" '.jobs += [{type:"edit", id:$id, pid:$p, started_at:$t}]' <<<"$st")"
+}
+claim_edit() {
+  reconcile_state
+  with_lock _claim_edit "$1" || exit 1
+  # shellcheck disable=SC2064  # the id is expanded now, on purpose (validated by id_valid)
+  trap "release_edit '$1'" EXIT
+}
+release_edit() { state_set --arg id "$1" '.jobs |= map(select(.type != "edit" or .id != $id))' 2>/dev/null || true; }
+
+sanitize_title() { # strip slashes/control chars, collapse spaces, ≤80 chars
+  local t="$1"; t="${t//\//-}"; t=$(printf '%s' "$t" | tr '[:cntrl:]' ' ' | sed -E 's/[[:space:]]+/ /g; s/^ //; s/ $//'); printf '%s' "${t:0:80}"
+}
+sanitize_note() { # control chars/newlines to spaces, collapse runs, ≤500 chars; slashes kept (a note is never a filename)
+  local t="$1"; t=$(printf '%s' "$t" | tr '[:cntrl:]' ' ' | sed -E 's/[[:space:]]+/ /g; s/^ //; s/ $//'); printf '%s' "${t:0:500}"
+}
+
+read_meta() { jq -c . "$1/meta.json"; }
+# write_initial_meta <dir> <id> <title> <source> <created>: the meta.json every recording starts with
+write_initial_meta() {
+  write_json "$1/meta.json" "$(jq -cn --arg id "$2" --arg title "$3" --arg source "$4" --arg created "$5" --argjson rate "$RATE" \
+    '{id:$id, title:$title, source:$source, created:$created, duration_s:null, size_bytes:0, sample_rate:$rate, transcript:null, notes:""}')"
+}
+# update_meta <dir> <filter> [jq args...]: values go in through --arg/--argjson,
+# never interpolated into the program; a failing filter leaves meta.json as is.
+# It is a read-modify-write like state.json, so it runs under the same lock:
+# two commands touching one recording's meta (a note during an export, say)
+# serialize instead of the later reader erasing the earlier write's fields.
+_update_meta() {
+  local dir="$1" filter="$2"; shift 2
+  local j; j=$(jq -c "$@" "$filter" "$dir/meta.json") || { log "update_meta failed in $dir: $filter"; return 1; }
+  write_json "$dir/meta.json" "$j"
+}
+update_meta() { with_lock _update_meta "$@"; }
+
+# Whole seconds, or nothing when ffprobe cannot tell (truncated file → "N/A").
+audio_duration() { local d; d=$(ffprobe -v error -show_entries format=duration -of csv=p=0 "$1" 2>/dev/null | cut -d. -f1); [[ "$d" =~ ^[0-9]+$ ]] && echo "$d"; return 0; }
+file_size() { stat -c %s "$1" 2>/dev/null || echo 0; }
+
+# rec_json <dir> → meta + dir + derived fields
+rec_json() {
+  local d="$1" has_t=false has_w=false has_o=false has_y=false has_p=false tfile=/dev/null yfile=/dev/null pfile=/dev/null
+  [[ -f "$d/transcript.md" ]] && has_t=true
+  [[ -s "$d/transcript.tidy.md" ]] && has_y=true
+  [[ -s "$d/transcript.prev.md" ]] && has_p=true
+  [[ -f "$d/waveform.png" ]] && has_w=true
+  [[ -f "$d/audio.orig.wav" ]] && has_o=true
+  # Text goes in via --rawfile (a long transcript blows past the argv size limit as
+  # --arg), already stripped of its header line by strip_header.
+  if [[ "${2:-}" == "--with-text" && -f "$d/transcript.md" ]]; then
+    tfile="$RUN_DIR/rec_json.$$.txt"; strip_header "$d/transcript.md" > "$tfile"
+    if [[ $has_y == true ]]; then yfile="$RUN_DIR/rec_json.$$.tidy"; strip_header "$d/transcript.tidy.md" > "$yfile"; fi
+    if [[ $has_p == true ]]; then pfile="$RUN_DIR/rec_json.$$.prev"; strip_header "$d/transcript.prev.md" > "$pfile"; fi
+  fi
+  jq -c --arg dir "$d" --argjson has_t "$has_t" --argjson has_w "$has_w" --argjson has_o "$has_o" --argjson has_y "$has_y" --argjson has_p "$has_p" \
+    --rawfile ttxt "$tfile" --rawfile ytxt "$yfile" --rawfile ptxt "$pfile" \
+    '. + {dir:$dir, audio:($dir+"/audio.wav"), has_transcript:$has_t, transcript_path:(if $has_t then $dir+"/transcript.md" else null end),
+          tidy_path:(if $has_y then $dir+"/transcript.tidy.md" else null end),
+          has_prev:$has_p, prev_path:(if $has_p then $dir+"/transcript.prev.md" else null end),
+          waveform:(if $has_w then $dir+"/waveform.png" else null end), has_orig:$has_o}
+       + (if $ttxt != "" then {transcript_text:$ttxt} else {} end)
+       + (if $ytxt != "" then {tidy_text:$ytxt} else {} end)
+       + (if $ptxt != "" then {prev_text:$ptxt} else {} end)' "$d/meta.json"
+  [[ "$tfile" == /dev/null ]] || rm -f "$tfile"
+  [[ "$yfile" == /dev/null ]] || rm -f "$yfile"
+  [[ "$pfile" == /dev/null ]] || rm -f "$pfile"
+}
+
+resolve_mic() {
+  local def; def=$(pactl get-default-source 2>/dev/null || true)
+  if [[ -n "$def" && "$def" != *.monitor ]] && pactl list short sources 2>/dev/null | awk '{print $2}' | grep -qx "$def"; then echo "$def"; return 0; fi
+  pactl list short sources 2>/dev/null | awk '$2 !~ /\.monitor$/ {print $2; exit}'
+}
+# The sink itself: pw-record captures its monitor with stream.capture.sink=true.
+# (There is no "<sink>.monitor" node in PipeWire; that name only exists in the
+# PulseAudio layer, and pw-record given it silently falls back to the microphone.)
+resolve_system() { pactl get-default-sink 2>/dev/null || true; }
+
+# ------------------------------------------------------------ record -------
+cmd_record() {
+  local sub="${1:-status}"; shift || true
+  case "$sub" in
+    start) record_start "$@" ;;
+    resume) record_resume "$@" ;;
+    stop) record_stop "$@" ;;
+    toggle) reconcile_state; if [[ $(jq -r '.recording != null' <<<"$(read_state)") == "true" ]]; then record_stop --guard; else record_start "$@"; fi ;;
+    status) cmd_status "$@" ;;
+    *) die "usage: record start [--source mic|system|both] [--title T] | resume | stop [--guard | --force] | toggle | status" ;;
+  esac
+}
+
+record_start() {
+  local source; source=$(cfg defaultSource); local title=""
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --source) need_val "$@"; source="$2"; shift 2 ;;
+      --title) need_val "$@"; title="$2"; shift 2 ;;
+      *) die "unknown option: $1" ;;
+    esac
+  done
+  [[ "$source" =~ ^(mic|system|both)$ ]] || die "source must be mic|system|both"
+  reconcile_state
+  [[ $(jq -r '.recording != null' <<<"$(read_state)") == "true" ]] && die "already recording"
+  have pw-record || die "pw-record not found (pipewire)"
+  mkdir -p "$ROOT" "$RUN_DIR"
+  title=$(sanitize_title "$title")
+  local dir id; dir=$(with_lock _claim_dir "$title") || die "could not create a folder for the recording"
+  id=$(basename "$dir"); id="${id%% *}"
+
+  local -a inputs=() # "kind|target|file", kind = mic (a source) or sink (its monitor)
+  local mic sys
+  case "$source" in
+    mic) mic=$(resolve_mic); [[ -n "$mic" ]] || { drop_empty_dir "$dir"; die "no microphone source found"; }; inputs+=("mic|$mic|$dir/audio.wav") ;;
+    system) sys=$(resolve_system); [[ -n "$sys" ]] || { drop_empty_dir "$dir"; die "no output sink found"; }; inputs+=("sink|$sys|$dir/audio.wav") ;;
+    both) mic=$(resolve_mic); sys=$(resolve_system)
+      [[ -n "$mic" && -n "$sys" ]] || { drop_empty_dir "$dir"; die "need both a microphone and an output sink"; }
+      inputs+=("mic|$mic|$dir/mic.wav" "sink|$sys|$dir/system.wav") ;;
+  esac
+
+  if ! spawn_recorders "${inputs[@]}"; then
+    rm -rf "$dir"; notify "Recording failed" "pw-record could not open $SPAWN_FAIL"
+    die "pw-record exited immediately for $SPAWN_FAIL"
+  fi
+  local pids="$SPAWNED_PIDS" files="$SPAWNED_FILES" p
+  start_keepawake "$(jq -r '.[0]' <<<"$pids")"
+  start_take_meter "$source" "${mic:-}" "${sys:-}" "$(jq -r '.[0]' <<<"$pids")"
+  local meter_pid="$METER_PID"
+  write_initial_meta "$dir" "$id" "$title" "$source" "$(now_iso)"
+  # Claim atomically: two rapid starts must not both pass the check above and
+  # leave one set of recorders orphaned with no state pointing at them. A new
+  # recording also withdraws any resume offer: only the last stop is resumable.
+  if ! with_lock _claim_recording --arg id "$id" --arg source "$source" --argjson pids "$pids" --argjson files "$files" --arg dir "$dir" --argjson t "$(now_epoch)" --argjson mp "$meter_pid" \
+    '.recording = {id:$id, source:$source, dir:$dir, started_at:$t, pids:$pids, files:$files, meter_pid:$mp} | .last_stop = null'; then
+    for p in $(jq -r '.[]' <<<"$pids"); do kill -INT "$p" 2>/dev/null || true; done
+    stop_meter "${meter_pid/null/}"
+    rm -rf "$dir"
+    die "already recording"
+  fi
+  log "record start $id source=$source dir=$dir"
+  local src_label; case "$source" in mic) src_label="microphone" ;; system) src_label="system audio" ;; both) src_label="microphone + system audio" ;; esac
+  notify "Recording started" "${title:-$id}, $src_label. Right-click the bar icon, or press your toggle key, to stop."
+  echo "$id"
+}
+
+# spawn_recorders <input>...: one pw-record per "kind|target|file" triple.
+# Fills SPAWNED_PIDS/SPAWNED_FILES (JSON arrays). When a recorder dies right
+# away every started one is stopped, SPAWN_FAIL names the target, and the
+# caller owns any folder cleanup (a fresh start removes its folder, a resume
+# must never touch the existing take).
+spawn_recorders() {
+  SPAWNED_PIDS='[]'; SPAWNED_FILES='[]'; SPAWN_FAIL=""
+  local in kind target file pid p i
+  for in in "$@"; do
+    kind="${in%%|*}"; in="${in#*|}"; target="${in%%|*}"; file="${in#*|}"
+    local -a props=(); [[ "$kind" == "sink" ]] && props=(-P '{ stream.capture.sink = true }')
+    setsid pw-record --target "$target" "${props[@]}" --rate "$RATE" --channels 1 --format s16 "$file" >/dev/null 2>&1 < /dev/null &
+    pid=$!
+    i=0
+    while (( i < 30 )) && pid_alive "$pid" && [[ ! -f "$file" ]]; do sleep 0.1; i=$((i+1)); done
+    if ! pid_alive "$pid"; then
+      for p in $(jq -r '.[]' <<<"$SPAWNED_PIDS"); do kill -INT "$p" 2>/dev/null || true; done
+      SPAWN_FAIL="$target"; return 1
+    fi
+    SPAWNED_PIDS=$(jq -c --argjson p "$pid" '. + [$p]' <<<"$SPAWNED_PIDS")
+    SPAWNED_FILES=$(jq -c --arg f "$file" '. + [$f]' <<<"$SPAWNED_FILES")
+  done
+}
+
+# start_keepawake <pid>: a systemd idle/sleep inhibitor that dies with that pid
+start_keepawake() {
+  [[ $(cfg keepAwake) == "true" ]] && have systemd-inhibit || return 0
+  setsid systemd-inhibit --what=idle:sleep --who=omarecorder --why="Recording audio" \
+    tail --pid="$1" -f /dev/null >/dev/null 2>&1 < /dev/null &
+}
+
+# start_take_meter <source> <mic> <sys> <first_pid>: sets METER_PID.
+# Live input meter: an independent ffmpeg reader on the same source writes
+# $LEVEL_FILE a few times a second; the shell watches that file. It lives and
+# dies with the first recorder (watchdog in _meter_loop) and never affects the take.
+start_take_meter() {
+  METER_PID=null
+  have ffmpeg || return 0
+  local mtarget="$2"; [[ "$1" == "system" ]] && mtarget="$3.monitor"   # ffmpeg -f pulse knows the .monitor name
+  write_json "$LEVEL_FILE" '{"peak_db":-99,"clip":false,"t":0}'
+  setsid "$SELF" _meter "$mtarget" "$4" >/dev/null 2>&1 < /dev/null &
+  METER_PID=$!
+}
+
+# record resume: continue the most recently stopped take. Never automatic (the
+# toggle and start always begin a new recording); only the last stop is
+# offered, only while the take is unedited, and for as long as the offer
+# stands (there is no time limit: a new recording, a trim or a delete is what
+# withdraws it). The new audio goes to separate segment files (audio.seg.wav,
+# or the mic/system pair for a "both" take) and is joined losslessly on stop,
+# so a crash mid-resume leaves the original exactly as it was.
+record_resume() {
+  [[ $# -eq 0 ]] || die "usage: record resume"
+  reconcile_state
+  local st; st=$(read_state)
+  [[ $(jq -r '.recording != null' <<<"$st") == "true" ]] && die "already recording"
+  local ls; ls=$(jq -c '.last_stop' <<<"$st")
+  [[ "$ls" != "null" ]] || die "nothing to resume"
+  local id; id=$(jq -r '.id // empty' <<<"$ls")
+  id_valid "$id" || { state_set '.last_stop = null'; die "nothing to resume"; }
+  [[ $(jq -r '.resumable == true' <<<"$ls") == "true" ]] || die "$id was trimmed; restore it first (trim $id --restore), then resume"
+  local dir; dir=$(rec_dir "$id") || { state_set '.last_stop = null'; die "no recording with id $id"; }
+  require_idle "$id"
+  # The disk is the truth on edits: any restore point or trim record means the
+  # audio is no longer what was stopped, and appending to it would be editing.
+  if [[ -f "$dir/audio.orig.wav" || $(jq -r 'has("trim")' "$dir/meta.json") == "true" ]]; then
+    die "$id was trimmed; restore it first (trim $id --restore), then resume"
+  fi
+  [[ -f "$dir/audio.wav" ]] || die "no audio.wav in $dir"
+  local source; source=$(jq -r '.source // ""' "$dir/meta.json")
+  [[ "$source" =~ ^(mic|system|both)$ ]] || die "$id cannot be resumed (source: ${source:-unknown})"
+  have pw-record || die "pw-record not found (pipewire)"
+  mkdir -p "$RUN_DIR"
+  # Resolve the capture targets first: read-only, and every failure from here
+  # to the offer take leaves the state untouched.
+  local -a inputs=(); local mic="" sys=""
+  case "$source" in
+    mic) mic=$(resolve_mic); [[ -n "$mic" ]] || die "no microphone source found"; inputs+=("mic|$mic|$dir/audio.seg.wav") ;;
+    system) sys=$(resolve_system); [[ -n "$sys" ]] || die "no output sink found"; inputs+=("sink|$sys|$dir/audio.seg.wav") ;;
+    both)
+      [[ -f "$dir/mic.wav" && -f "$dir/system.wav" ]] || die "$id is missing its raw tracks (mic.wav/system.wav) and cannot be resumed"
+      mic=$(resolve_mic); sys=$(resolve_system)
+      [[ -n "$mic" && -n "$sys" ]] || die "need both a microphone and an output sink"
+      inputs+=("mic|$mic|$dir/mic.seg.wav" "sink|$sys|$dir/system.seg.wav") ;;
+  esac
+  # Take the offer and reserve the recording slot in ONE locked write, BEFORE
+  # touching the shared segment files: of two overlapping resumes only one
+  # gets the offer, and the reservation makes require_idle refuse a trim,
+  # rename, delete or transcribe of this take (and _claim_recording a new
+  # start) for the moments the recorders need to come up.
+  local offer; offer=$(with_lock _take_resume_offer "$id" "$source" "$dir") \
+    || die "could not resume $id (the offer was withdrawn or a recording started)"
+  rm -f "$dir/audio.seg.wav" "$dir/mic.seg.wav" "$dir/system.seg.wav"
+  if ! spawn_recorders "${inputs[@]}"; then
+    rm -f "$dir/audio.seg.wav" "$dir/mic.seg.wav" "$dir/system.seg.wav"
+    with_lock _rollback_resume "$id" "$offer" || true
+    notify "Resume failed" "pw-record could not open $SPAWN_FAIL"
+    die "pw-record exited immediately for $SPAWN_FAIL"
+  fi
+  local pids="$SPAWNED_PIDS" files="$SPAWNED_FILES" p
+  start_keepawake "$(jq -r '.[0]' <<<"$pids")"
+  start_take_meter "$source" "$mic" "$sys" "$(jq -r '.[0]' <<<"$pids")"
+  local meter_pid="$METER_PID"
+  # The reservation becomes the real recording entry (recorder pids, meter).
+  # Failure means the state changed underneath us; stop our recorders and
+  # leave the world as it is rather than record blind.
+  if ! with_lock _activate_resume "$id" --arg id "$id" --arg source "$source" --argjson pids "$pids" --argjson files "$files" --arg dir "$dir" --argjson t "$(now_epoch)" --argjson mp "$meter_pid" \
+    '.recording = {id:$id, source:$source, dir:$dir, started_at:$t, pids:$pids, files:$files, meter_pid:$mp, resume:true}'; then
+    for p in $(jq -r '.[]' <<<"$pids"); do kill -INT "$p" 2>/dev/null || true; done
+    stop_meter "${meter_pid/null/}"
+    rm -f "$dir/audio.seg.wav" "$dir/mic.seg.wav" "$dir/system.seg.wav"
+    die "could not resume $id (the recording state changed while it was starting)"
+  fi
+  log "record resume $id source=$source dir=$dir"
+  local ttl; ttl=$(jq -r '.title // empty' "$dir/meta.json"); ttl="${ttl:-$id}"
+  notify "Recording resumed" "$ttl. The new audio is appended when you stop."
+  echo "$id"
+}
+
+record_stop() { # [--guard | --force]
+  local guard=0
+  if [[ $# -gt 0 ]]; then
+    case "$1" in --guard) guard=1 ;; --force) ;; *) die "unknown option: $1" ;; esac
+  fi
+  reconcile_state
+  # One stray keypress must not end a long take: with --guard (the toggle, the
+  # keybinding, the popup's r) a stop past the threshold only arms a 10 second
+  # window, and a second one inside it goes through. A plain stop is a script
+  # or the Stop button saying stop, so it stops; --force is the old spelling.
+  if (( guard == 1 && STOP_CONFIRM_S > 0 )); then
+    local rec0 now armed elapsed; rec0=$(jq -c '.recording' <<<"$(read_state)")
+    if [[ "$rec0" != "null" ]]; then
+      now=$(now_epoch)
+      elapsed=$(( now - $(jq -r '.started_at // 0' <<<"$rec0") ))
+      armed=$(jq -r '.stop_armed_at // 0' <<<"$rec0")
+      if (( elapsed >= STOP_CONFIRM_S && now - armed > 10 )); then
+        state_set --argjson t "$now" '.recording |= (if . == null then . else . + {stop_armed_at:$t} end)'
+        notify "Stop this recording?" "It is $(fmt_hms "$elapsed") long. Stop again within 10 seconds to confirm."
+        echo "confirm"
+        return 0
+      fi
+    fi
+  fi
+  # Take the entry and null it in one locked step: from here on no concurrent
+  # status/toggle can see a "dead" recording and run recovery while we finalize.
+  local rec trc=0; rec=$(with_lock _take_recording) || trc=$?
+  (( trc == 2 )) && die "a resume is still starting; try again in a moment"
+  (( trc != 0 )) && die "not recording"
+  # The stop moment, before the recorders wind down and the slow finalize
+  # runs: arm_resume orders offers by it (see the guard there).
+  local stopped_epoch; stopped_epoch=$(now_epoch)
+  local id dir source; id=$(jq -r '.id' <<<"$rec"); dir=$(jq -r '.dir' <<<"$rec"); source=$(jq -r '.source' <<<"$rec")
+  local p
+  for p in $(jq -r '.pids[]' <<<"$rec"); do recorder_alive "$p" && kill -INT "$p" 2>/dev/null || true; done
+  local i=0
+  while (( i < 50 )); do
+    local any=0
+    for p in $(jq -r '.pids[]' <<<"$rec"); do recorder_alive "$p" && any=1; done
+    [[ $any == 0 ]] && break; sleep 0.2; i=$((i+1))
+  done
+  for p in $(jq -r '.pids[]' <<<"$rec"); do recorder_alive "$p" && kill -TERM "$p" 2>/dev/null || true; done
+  stop_meter "$(jq -r '.meter_pid // empty' <<<"$rec")"
+  bump_state
+  [[ -d "$dir" ]] || die "recording folder vanished: $dir"
+
+  if [[ $(jq -r '.resume // false' <<<"$rec") == "true" ]]; then
+    # A resumed take: the fresh segment(s) are joined onto the original.
+    # append_segments is all-or-nothing, so a failure leaves the take exactly
+    # as it was, with the segment files kept next to it.
+    if ! append_segments "$dir" "$source"; then
+      bump_state
+      notify "Recording saved, but joining failed · ${id}" "the original take is untouched and the new segment is kept next to it (details: $LOG_FILE)"
+      die "could not join the resumed segment for $id; it is kept in $dir"
+    fi
+  elif [[ "$source" == "both" ]] && ! mix_both "$dir"; then
+    bump_state
+    notify "Recording saved, but mixing failed · ${id}" "mic.wav and system.wav are kept in the recording folder; audio.wav could not be produced (details: $LOG_FILE)"
+    die "amix failed for $id; mic.wav and system.wav are kept in $dir"
+  fi
+  finalize_audio "$dir"
+  analyze_levels "$dir"
+  arm_resume "$dir" "$id" "$stopped_epoch"   # duration/levels are in meta now; the write also lets the UI re-list
+  local dur; dur=$(jq -r '.duration_s // 0' "$dir/meta.json")
+  log "record stop $id duration=${dur}s"
+  local ttl; ttl=$(jq -r '.title // empty' "$dir/meta.json"); ttl="${ttl:-$id}"
+  # autoTranscribe starts the transcription without a click, but only when the
+  # default model is already on disk: a settings toggle must never trigger a
+  # multi-GB download on its own. With the model missing, the clickable
+  # notification below is the fallback (its click may download; a click is
+  # consent). The auto-fire is refused harmlessly by _claim_tx if the
+  # notification is clicked too.
+  local auto=0
+  [[ $(cfg autoTranscribe) == "true" ]] && model_installed "$(cfg defaultModel)" && auto=1
+  if [[ $(jq -r '.levels.clipped // false' "$dir/meta.json") == "true" ]]; then
+    if (( auto )); then
+      notify "Recording saved · $(fmt_hms "$dur") (audio is clipping)" "$ttl: the microphone gain is too high; lower the input level before the next session. Transcribing with $(model_label "$(cfg defaultModel)") now" -- "$SELF" transcribe "$id" --download
+    else
+      notify "Recording saved · $(fmt_hms "$dur") (audio is clipping)" "$ttl: the microphone gain is too high; lower the input level before the next session. Click to transcribe anyway." -- "$SELF" transcribe "$id" --download
+    fi
+  elif (( auto )); then
+    notify "Recording saved · $(fmt_hms "$dur")" "$ttl. Transcribing with $(model_label "$(cfg defaultModel)") now" -- "$SELF" transcribe "$id" --download
+  else
+    notify "Recording saved · $(fmt_hms "$dur")" "$ttl. Click to transcribe with $(model_label "$(cfg defaultModel)")" -- "$SELF" transcribe "$id" --download
+  fi
+  if (( auto )); then
+    if [[ "${OMARECORDER_SYNC:-0}" == "1" ]]; then
+      "$SELF" transcribe "$id" >/dev/null 2>&1 || true
+    else
+      # setsid, not a plain call: where systemd-run is absent, run_detached
+      # falls back to running the worker inline, and that must not hold
+      # record stop (and the UI process behind it) for the whole pass.
+      setsid "$SELF" transcribe "$id" >/dev/null 2>&1 < /dev/null &
+    fi
+  fi
+  echo "$id ($(fmt_hms "$dur"))"
+}
+
+# mix_pair <mic> <sys> <out>: two tracks → one mono mix at the whisper rate
+mix_pair() {
+  local out="$3"
+  ffmpeg -v error -y -i "$1" -i "$2" \
+    -filter_complex "amix=inputs=2:duration=longest:normalize=0" -ar "$RATE" -ac 1 -c:a pcm_s16le "$out.tmp.$$.wav" 2>>"$LOG_FILE" \
+    && mv -f "$out.tmp.$$.wav" "$out" || { rm -f "$out.tmp.$$.wav"; log "amix failed for $out"; return 1; }
+}
+# mix_both <dir>: mic.wav + system.wav → audio.wav
+mix_both() { mix_pair "$1/mic.wav" "$1/system.wav" "$1/audio.wav"; }
+
+# concat_wav <dir> <base> <seg>: base + seg → <base>.cat.tmp.$$.wav, losslessly
+# (identical formats, `-c copy` through the concat demuxer). The list file
+# holds only the two fixed file names, relative to the folder it sits in, so
+# no user-controlled path ever enters it.
+concat_wav() {
+  local dir="$1" base="$2" seg="$3" list="$1/concat.tmp.$$.txt"
+  printf "file '%s'\nfile '%s'\n" "$base" "$seg" > "$list"
+  if ffmpeg -v error -y -f concat -i "$list" -c copy "$dir/$base.cat.tmp.$$.wav" 2>>"$LOG_FILE"; then rm -f "$list"
+  else rm -f "$list" "$dir/$base.cat.tmp.$$.wav"; log "concat failed for $dir/$base"; return 1; fi
+}
+
+# append_segments <dir> <source>: join the resume segment(s) onto the take and
+# note the seam. For "both" the fresh pair is mixed first, then all three
+# files are joined. All-or-nothing: every concat lands in a temp and the
+# originals are replaced only once all of them succeeded, so a failure leaves
+# the take as it was, with the segment files still in the folder. An existing
+# transcript no longer describes the audio, so it is flagged stale like trim.
+append_segments() {
+  local dir="$1" source="$2" seam b
+  if [[ "$source" == "both" ]]; then
+    [[ -f "$dir/mic.seg.wav" && -f "$dir/system.seg.wav" ]] || { log "resume: segment tracks missing in $dir"; return 1; }
+    mix_pair "$dir/mic.seg.wav" "$dir/system.seg.wav" "$dir/audio.seg.wav" || return 1
+  fi
+  [[ -f "$dir/audio.seg.wav" ]] || { log "resume: no audio.seg.wav in $dir"; return 1; }
+  seam=$(audio_duration "$dir/audio.wav"); seam=${seam:-0}
+  local -a bases=(audio)
+  [[ "$source" == "both" ]] && bases+=(mic system)
+  for b in "${bases[@]}"; do
+    concat_wav "$dir" "$b.wav" "$b.seg.wav" || { rm -f "$dir"/*.cat.tmp.*.wav; return 1; }
+  done
+  for b in "${bases[@]}"; do mv -f "$dir/$b.wav.cat.tmp.$$.wav" "$dir/$b.wav"; done
+  rm -f "$dir/audio.seg.wav" "$dir/mic.seg.wav" "$dir/system.seg.wav"
+  update_meta "$dir" '.resume_seams = ((.resume_seams // []) + [$s]) | (if .transcript != null then .transcript.stale = true | .transcript.stale_reason = "resume" else . end)' \
+    --argjson s "$seam"
+  return 0
+}
+
+# recover_segments <dir>: the crash-recovery leg of resume. The original take
+# is intact on disk; only the segment(s) need a header repair before the same
+# join a clean stop performs. A husk with nothing beyond a WAV header is
+# dropped so the take stays exactly as it was.
+recover_segments() {
+  local ddir="$1" source f keep=0
+  source=$(jq -r '.source // ""' "$ddir/meta.json" 2>/dev/null)
+  for f in "$ddir/audio.seg.wav" "$ddir/mic.seg.wav" "$ddir/system.seg.wav"; do
+    [[ -f "$f" ]] || continue
+    repair_wav "$f" || true
+    (( $(file_size "$f") > 44 )) && keep=1
+  done
+  if (( keep == 0 )); then
+    rm -f "$ddir/audio.seg.wav" "$ddir/mic.seg.wav" "$ddir/system.seg.wav"
+    log "resume recovery: dropped empty segment in $ddir"; return 0
+  fi
+  if append_segments "$ddir" "$source"; then log "resume recovery: joined segment in $ddir"
+  else log "resume recovery: could not join segment in $ddir; the files are kept"; fi
+  return 0
+}
+
+# arm_resume <dir> <id> <stopped_epoch>: remember a clean stop so `record
+# resume` can continue this take. There is no time limit: the offer stands
+# until it is consumed, a new recording starts, or the take is trimmed or
+# deleted. The stop of a resumed take lands here too: it becomes the last
+# stop again. stopped_epoch is when the recorders were told to stop, not
+# when the slow finalize (mixing, waveform, levels) ended, and the write is
+# guarded: by arm time a newer take may have started (its start cleared the
+# offer on purpose) or stopped (its offer is newer), and an older stop must
+# never clobber either.
+arm_resume() {
+  local dir="$1" id="$2" stopped="$3" ttl
+  ttl=$(jq -r '.title // ""' "$dir/meta.json" 2>/dev/null || echo "")
+  state_set --arg id "$id" --arg t "$ttl" --argjson at "$stopped" \
+    '.last_stop = (if .recording == null and ((.last_stop == null) or ((.last_stop.stopped_at // 0) <= $at))
+       then {id:$id, title:$t, stopped_at:$at, resumable:true} else .last_stop end)'
+}
+
+# finalize_audio <dir>: fill duration/size in meta.json from audio.wav, and
+# redraw the waveform strip (record stop, import, crash recovery, trim all end here).
+finalize_audio() {
+  local dir="$1" dur size
+  dur=$(audio_duration "$dir/audio.wav"); dur=${dur:-0}
+  size=$(file_size "$dir/audio.wav")
+  update_meta "$dir" '.duration_s = $d | .size_bytes = $s' --argjson d "$dur" --argjson s "$size"
+  make_waveform "$dir"
+}
+
+# make_waveform <dir>: audio.wav → waveform.png, the strip the Library draws
+# behind the trim handles. Mid-grey reads on light and dark themes; sqrt
+# scaling keeps quiet speech visible next to loud passages. Best effort only:
+# a missing strip never fails a stop or an import.
+make_waveform() {
+  local dir="$1"; [[ -f "$dir/audio.wav" ]] && have ffmpeg || return 0
+  ffmpeg -v error -y -i "$dir/audio.wav" -filter_complex "showwavespic=s=${WAVE_W}x${WAVE_H}:colors=#888888:scale=sqrt" \
+    -frames:v 1 -update 1 "$dir/waveform.png.tmp.$$.png" 2>>"$LOG_FILE" && mv -f "$dir/waveform.png.tmp.$$.png" "$dir/waveform.png" \
+    || { rm -f "$dir/waveform.png.tmp.$$.png"; log "waveform failed in $dir"; }
+  return 0
+}
+
+# png_width <file>: width from the PNG IHDR (bytes 16-19, big-endian); empty
+# on anything that is not a readable PNG. A 4-byte read, so list can afford it
+# per recording.
+png_width() {
+  local b
+  b=$(od -An -tu1 -j16 -N4 -- "$1" 2>/dev/null) || return 0
+  # shellcheck disable=SC2086
+  set -- $b
+  [[ $# -eq 4 ]] && echo $(( ($1 << 24) | ($2 << 16) | ($3 << 8) | $4 ))
+  return 0
+}
+
+# repair_wav <file>: a recorder that died (crash, power loss) never wrote the
+# RIFF and data chunk sizes. ffprobe still guesses a duration from the file
+# size, so the take looks fine in the Library, but whisper trusts the header
+# and reads zero samples (or refuses the file outright). A duration alone is
+# therefore not proof; the data chunk's declared size has to fit the file.
+# Re-muxing with ffmpeg rewrites the header from the data.
+repair_wav() {
+  local f="$1"
+  [[ -f "$f" ]] || return 1
+  local d; d=$(audio_duration "$f")
+  if [[ -n "$d" && "$d" != "0" ]]; then
+    local off dsz fsz
+    off=$(head -c 4096 "$f" | grep -obUaP 'data' | head -1 | cut -d: -f1) || off=""
+    [[ "$off" =~ ^[0-9]+$ ]] || return 0   # no data chunk in the header: nothing a remux could fix
+    dsz=$(od -An -tu4 -j $((off + 4)) -N4 "$f" 2>/dev/null | tr -d ' '); fsz=$(file_size "$f")
+    [[ "$dsz" =~ ^[0-9]+$ ]] && (( dsz > 0 && dsz <= fsz - off - 8 )) && return 0
+  fi
+  ffmpeg -v error -y -i "$f" -c copy "$f.repair.wav" 2>>"$LOG_FILE" && mv -f "$f.repair.wav" "$f" && log "repaired wav header: $f"
+}
+
+# analyze_levels <dir>: peak/RMS/flatness via ffmpeg astats → meta.levels.
+# A hard-clipped take sits at ~0 dBFS with many flat (saturated) runs; a
+# healthy one peaks well below that. Cheap (decode only), so run it on every
+# stop and import: it is the only way the user finds out before transcribing.
+analyze_levels() {
+  local dir="$1"; local f="$dir/audio.wav"; [[ -f "$f" ]] || return 0
+  # The ADC rails for the first ~0.7 s after capture starts (settling
+  # transient); skip the head so a clean take is not reported as clipped.
+  local skip=0 d; d=$(audio_duration "$f"); [[ "${d:-0}" =~ ^[0-9]+$ ]] && (( d > 6 )) && skip=2
+  local stats; stats=$(ffmpeg -nostats -ss "$skip" -i "$f" -af "astats=measure_perchannel=none:measure_overall=Peak_level+RMS_level+Flat_factor+Peak_count+Number_of_samples" -f null - 2>&1 | grep -E 'Peak level dB|RMS level dB|Flat factor|Peak count|Number of samples' | tail -5)
+  local peak rms flat pc ns
+  peak=$(sed -n 's/.*Peak level dB: *//p' <<<"$stats" | head -1); rms=$(sed -n 's/.*RMS level dB: *//p' <<<"$stats" | head -1)
+  flat=$(sed -n 's/.*Flat factor: *//p' <<<"$stats" | head -1); pc=$(sed -n 's/.*Peak count: *//p' <<<"$stats" | head -1); ns=$(sed -n 's/.*Number of samples: *//p' <<<"$stats" | head -1)
+  [[ "$peak" =~ ^-?[0-9.]+$ && "$flat" =~ ^-?[0-9.]+$ && "$pc" =~ ^[0-9.]+$ && "$ns" =~ ^[0-9.]+$ ]] || return 0
+  [[ "$rms" =~ ^-?[0-9.]+$ ]] || rms="-99"
+  # clipped_pct = share of samples sitting on the rail. A stray transient is
+  # a handful of samples; a hot mic parks thousands per second there.
+  local pct; pct=$(awk -v c="$pc" -v n="$ns" 'BEGIN{ if (n < 1) n = 1; printf "%.3f", 100 * c / n }')
+  local clipped=false; awk -v p="$peak" -v fl="$flat" -v x="$pct" 'BEGIN{exit !(p > -0.5 && (x > 0.05 || fl > 2))}' && clipped=true
+  update_meta "$dir" '.levels = {peak_db: $p, rms_db: $r, flat: $f, clipped_pct: $x, clipped: $c}' \
+    --argjson p "$peak" --argjson r "$rms" --argjson f "$flat" --argjson x "$pct" --argjson c "$clipped"
+  [[ $clipped == true ]] && log "levels: CLIPPED $dir peak=$peak rms=$rms flat=$flat clipped_pct=$pct"
+  return 0
+}
+
+# ------------------------------------------------------- level meter ------
+# Only signal a pid that is still our meter (pids get recycled across boots of the state file).
+stop_meter() {
+  if [[ "${1:-}" =~ ^[0-9]+$ ]] && grep -qa '_meter' "/proc/$1/cmdline" 2>/dev/null; then kill -TERM "$1" 2>/dev/null; fi
+  rm -f "$LEVEL_FILE"; return 0
+}
+
+# _meter <pulse-source> <recorder-pid>: ffmpeg measures 250 ms frames of the
+# input; _meter_loop turns them into $LEVEL_FILE. Detached from the shell.
+_meter() {
+  local target="$1" recpid="${2:-}"
+  trap 'pkill -TERM -P $$ 2>/dev/null; rm -f "$LEVEL_FILE"; exit 0' TERM INT
+  ffmpeg -nostdin -nostats -v error -f pulse -i "$target" \
+    -af "aformat=sample_rates=$RATE:channel_layouts=mono,asetnsamples=n=$((RATE / 4)),astats=metadata=1:reset=1:measure_perchannel=none:measure_overall=Peak_level+Peak_count,ametadata=print:file=-:direct=1" \
+    -f null - 2>/dev/null | _meter_loop "$LEVEL_FILE" "$recpid" &
+  wait
+  rm -f "$LEVEL_FILE"
+}
+# _meter_loop <file> <recorder-pid> [--keep]: stdin = ametadata lines.
+# Skips the first second (the ADC rails while capture settles), writes
+# {"peak_db","clip","t"} atomically per frame, holds "clip" for 1.5 s so a
+# brief overload is visible, stops when the recorder is gone.
+_meter_loop() {
+  local file="$1" recpid="${2:-}" keep="${3:-}" t=0 peak="" count="" hold=0 clip line
+  while IFS= read -r line; do
+    case "$line" in
+      frame:*) t="${line##*pts_time:}"; t="${t%% *}" ;;
+      lavfi.astats.Overall.Peak_level=*) peak="${line#*=}" ;;
+      lavfi.astats.Overall.Peak_count=*)
+        count="${line#*=}"
+        awk -v t="$t" 'BEGIN{exit !(t >= 1.0)}' || continue
+        [[ "$peak" =~ ^-?[0-9]+([.][0-9]+)?$ ]] || peak="-99"
+        count="${count%%.*}"; [[ "$count" =~ ^[0-9]+$ ]] || count=0   # ffmpeg prints it as a float
+        awk -v p="$peak" -v c="$count" 'BEGIN{exit !(p > -0.5 && c >= 2)}' && hold=6
+        clip=false; if (( hold > 0 )); then clip=true; hold=$((hold - 1)); fi
+        printf '{"peak_db":%s,"clip":%s,"t":%s}\n' "$peak" "$clip" "$(date +%s)" > "$file.tmp" && mv -f "$file.tmp" "$file"
+        [[ -n "$recpid" ]] && ! pid_alive "$recpid" && break ;;
+    esac
+  done
+  [[ "$keep" == "--keep" ]] || rm -f "$file"
+  return 0
+}
+
+# ------------------------------------------------------------ status -------
+cmd_status() {
+  local as_json=0; want_json "$@" && as_json=1
+  reconcile_state
+  local st; st=$(read_state)
+  local out; out=$(jq -c --argjson now "$(now_epoch)" --arg mdir "$VOXTYPE_MODELS_DIR" '
+    .recording |= (if . == null then null else . + {elapsed_s: ($now - .started_at)} end)
+    | .jobs |= map(. + {elapsed_s: ($now - .started_at)})
+    | .resume = (.last_stop as $ls | if .recording == null and $ls != null and $ls.resumable == true
+          and (([.jobs[] | select(.type == "transcribe" and .id == $ls.id)] | length) == 0)
+        then ($ls + {stopped_ago_s: ($now - ($ls.stopped_at // $now))}) else null end)' <<<"$st")
+  # Download progress (bytes_done) is written into the job by _dl_worker itself.
+  if (( as_json )); then jq . <<<"$out"; return 0; fi
+  if [[ $(jq -r '.recording != null' <<<"$out") == "true" ]]; then
+    echo "recording $(jq -r '.recording.id' <<<"$out") ($(fmt_hms "$(jq -r '.recording.elapsed_s' <<<"$out")"), $(jq -r '.recording.source' <<<"$out"))"
+  else echo "idle"; fi
+  jq -r '.jobs[] | "job: \(.type) \(.id // .model) (\(.elapsed_s)s)"' <<<"$out"
+}
+
+# --------------------------------------------------------------- import ----
+cmd_import() {
+  local src="" move=0 title=""
+  while [[ $# -gt 0 ]]; do
+    case "$1" in --move) move=1; shift ;; --title) need_val "$@"; title="$2"; shift 2 ;; -*) die "unknown option: $1" ;; *) src="$1"; shift ;; esac
+  done
+  src="${src/#\~/$HOME}"
+  [[ -f "$src" ]] || die "file not found: $src"
+  mkdir -p "$ROOT"
+  title=$(sanitize_title "${title:-$(basename "${src%.*}")}")
+  # Same-second collisions (two files from one batch) take the next free second.
+  local dir id; dir=$(with_lock _claim_dir "$title" "$(date -r "$src" +%s)") || die "could not create a folder for $src"
+  id=$(basename "$dir"); id="${id%% *}"
+  local probe; probe=$(ffprobe -v error -select_streams a:0 -show_entries stream=sample_rate,channels,codec_name -of csv=p=0 "$src" 2>/dev/null || true)
+  # Converted (or copied) under a temporary name and renamed at the end: the
+  # crash sweep reads a folder holding only audio.wav as a dead take, and a
+  # long conversion could outlast its five-minute guard.
+  # The source outlives every step that can fail: it goes only once the take
+  # has its audio.wav and meta.json (a --move used to remove it before the
+  # part was promoted, and a failure in between lost the recording).
+  local part="$dir/.import.part.wav"
+  if [[ "$probe" == "pcm_s16le,$RATE,1" ]]; then
+    cp --preserve=timestamps -- "$src" "$part" || { rm -rf "$dir"; die "could not copy $src"; }   # timestamps only: the mode stays ours (0600)
+  else
+    ffmpeg -v error -y -i "$src" -ar "$RATE" -ac 1 -c:a pcm_s16le "$part" || { rm -rf "$dir"; die "ffmpeg failed to convert $src"; }
+  fi
+  mv -f -- "$part" "$dir/audio.wav" || { rm -rf "$dir"; die "could not place the converted audio in $dir"; }
+  write_initial_meta "$dir" "$id" "$title" "import" "$(date -r "$dir/audio.wav" +%FT%T%z)"
+  # A source that cannot be removed (a read-only folder) is not a failed
+  # import: the take is complete, so finish it and say so in the log.
+  if (( move )) && ! rm -f -- "$src" 2>/dev/null; then log "import --move: could not remove $src"; fi
+  finalize_audio "$dir"; analyze_levels "$dir"; bump_state
+  log "import $src -> $dir"
+  echo "$id"
+}
+
+# ----------------------------------------------------------- list/show -----
+# search <text>: ids of recordings whose transcript contains the text.
+# Case-insensitive fixed-string match over what the user reads (tidy when it
+# exists, raw otherwise), header line excluded; emits a JSON array of ids.
+# Read-only: the query travels as an argument into grep -F, never a pattern.
+cmd_search() {
+  # One argument, the text. An option is refused rather than searched for
+  # (search --json foo used to look for "--json"); a single leading dash is
+  # still text, "-5 dB" being a fine thing to look for.
+  [[ "${1:-}" == --* ]] && die "unknown option: $1 (search takes one argument, the text)"
+  [[ $# -le 1 ]] || die "usage: search <text> (quote it if it has spaces)"
+  local q="${1:-}"; [[ -n "$q" ]] || die "usage: search <text>"
+  mkdir -p "$ROOT"
+  local d f b
+  local -a ids=()
+  while IFS= read -r d; do
+    [[ -f "$d/meta.json" ]] || continue
+    b="${d##*/}"
+    # The title and note first, as the Library's search box matches them.
+    if jq -r '[(.title // ""), (.notes // "")] | join("\n")' "$d/meta.json" 2>/dev/null | grep -iF -- "$q" >/dev/null; then ids+=("${b%% *}"); continue; fi
+    f=$(transcript_file "$d")
+    [[ -s "$f" ]] || continue
+    # No -q: it would exit at the first match, hand sed a SIGPIPE on any
+    # transcript larger than the pipe buffer, and pipefail would turn the
+    # found match into a non-match (141). Reading to the end is cheap here.
+    if strip_header "$f" | grep -iF -- "$q" >/dev/null; then ids+=("${b%% *}"); fi
+  done < <(find "$ROOT" -mindepth 1 -maxdepth 1 -type d -name '????-??-??_??????*' | sort -r)
+  jq -cn '$ARGS.positional' --args -- ${ids[@]+"${ids[@]}"}
+}
+
+cmd_list() {
+  local as_json=0; want_json "$@" && as_json=1
+  mkdir -p "$ROOT"
+  # Seed before the freshness checks below: on an upgrade every tidy file is
+  # current and nothing else would ever create the starter dictionary, and the
+  # fresh file's mtime is what makes the same pass rebuild those tidies.
+  seed_dictionary
+  # One jq per recording plus a single collect: rebuilding a growing array per
+  # row was O(n^2) and made the Library open slow at a few hundred recordings.
+  local arr d
+  arr=$(
+    while IFS= read -r d; do
+      [[ -f "$d/meta.json" ]] || continue
+      # Recordings made before 1.0 get their waveform and tidy transcript here,
+      # once (cheap, never repeated). Strips drawn at an older, softer size are
+      # redrawn the same way; once redrawn the width matches and the check
+      # (a 4-byte header read) never fires again.
+      if [[ -s "$d/audio.wav" ]] && { [[ ! -f "$d/waveform.png" ]] || [[ "$(png_width "$d/waveform.png")" != "$WAVE_W" ]]; }; then make_waveform "$d"; fi
+      # Tidy is rebuilt when missing, and once more for files from before the
+      # collapse markers and loop stats existed: the old header has no "loops"
+      # field, and after one rebuild it does, so the check (one head -1) never
+      # fires again.
+      # A dictionary edited after a tidy was built means stale corrections:
+      # rebuild once, and the fresh tidy's mtime stops the check firing again.
+      if [[ -s "$d/transcript.md" ]] && { [[ ! -s "$d/transcript.tidy.md" ]] || ! head -1 "$d/transcript.tidy.md" | grep -q " loops," || [[ -f "$DICT_FILE" && "$DICT_FILE" -nt "$d/transcript.tidy.md" ]]; }; then tidy_transcript "$d"; fi
+      rec_json "$d"
+    done < <(find "$ROOT" -mindepth 1 -maxdepth 1 -type d -name '????-??-??_??????*' | sort -r) | jq -sc '.'
+  )
+  [[ -n "$arr" ]] || arr='[]'
+  if (( as_json )); then jq . <<<"$arr"; return 0; fi
+  # A human at an empty terminal deserves a next step; scripts (no tty) keep
+  # getting the clean empty output they parse.
+  if [[ "$arr" == "[]" && -t 1 ]]; then echo "No recordings yet. Start one with: omarecorder record start"; return 0; fi
+  while IFS=$'\t' read -r rid rdur rt rclip rtitle; do
+    printf '%s  %s  %s%s  %s\n' "$rid" "$(fmt_hms "$rdur")" "$rt" "$([[ $rclip == true ]] && echo ' ⚠clipped' || echo '')" "$rtitle"
+  done < <(jq -r '.[] | [.id, (.duration_s // 0), (if .has_transcript then "✓" else "·" end), (.levels.clipped // false), .title] | @tsv' <<<"$arr")
+}
+
+cmd_analyze() { # analyze <id>: (re)measure levels for an existing recording
+  local id="${1:-}"; [[ -n "$id" ]] || die "usage: analyze <id>"
+  local dir; dir=$(require_dir "$id"); analyze_levels "$dir"; make_waveform "$dir"; bump_state
+  jq -c '.levels // {}' "$dir/meta.json"
+}
+
+# trim <id> --from s --to s [--replace] | trim <id> --restore
+# Cuts audio.wav down to [from, to]. The first original is kept as
+# audio.orig.wav (later trims cut the already-trimmed take and leave that
+# original alone) unless --replace; --restore puts it back. The raw takes of a
+# "both" recording (mic.wav / system.wav) are never touched. An existing
+# transcript is flagged stale: it still describes the old audio.
+cmd_trim() {
+  local usage="usage: trim <id> --from s --to s [--replace] | trim <id> --restore"
+  local id="${1:-}" from="" to="" replace=0 restore=0; [[ -n "$id" ]] || die "$usage"; shift
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --from) need_val "$@"; from="$2"; shift 2 ;; --to) need_val "$@"; to="$2"; shift 2 ;;
+      --replace) replace=1; shift ;; --restore) restore=1; shift ;;
+      *) die "unknown option: $1" ;;
+    esac
+  done
+  local dir; dir=$(require_dir "$id")
+  claim_edit "$id"
+  if (( restore )); then
+    [[ -f "$dir/audio.orig.wav" ]] || die "nothing to restore: $id has no audio.orig.wav"
+    mv -f "$dir/audio.orig.wav" "$dir/audio.wav"
+    finalize_audio "$dir"; analyze_levels "$dir"
+    update_meta "$dir" 'del(.trim) | (if .transcript != null then .transcript.stale = true | .transcript.stale_reason = "restore" else . end)'
+    # The take is back to the audio that was stopped, so a standing resume
+    # offer for it is valid again (restore first, then resume and recut).
+    state_set --arg id "$id" '.last_stop |= (if . != null and .id == $id then . + {resumable:true} else . end)'
+    log "trim restore $id"
+    echo "$id ($(fmt_hms "$(jq -r '.duration_s // 0' "$dir/meta.json")"))"; return 0
+  fi
+  [[ -n "$from" && -n "$to" ]] || die "$usage"
+  valid_seconds "$from" || die "--from must be a non-negative number of seconds"
+  valid_seconds "$to" || die "--to must be a non-negative number of seconds"
+  awk -v a="$from" -v b="$to" 'BEGIN{exit !(b > a)}' || die "--to must be greater than --from"
+  [[ -f "$dir/audio.wav" ]] || die "no audio.wav in $dir"
+  local dur; dur=$(jq -r '.duration_s // 0' "$dir/meta.json")
+  awk -v b="$to" -v d="$dur" 'BEGIN{exit !(b <= d + 1)}' || die "--to is past the end of the recording (${dur} s)"
+  local tmp="$dir/audio.trim.tmp.$$.wav"   # $$: two trims of one take must not share a temp
+  ffmpeg -v error -y -ss "$from" -to "$to" -i "$dir/audio.wav" -c copy "$tmp" 2>>"$LOG_FILE" || { rm -f "$tmp"; die "ffmpeg could not cut $id (details: $LOG_FILE)"; }
+  (( $(file_size "$tmp") > 44 )) || { rm -f "$tmp"; die "that range holds no audio"; }   # 44 bytes = a bare WAV header
+  if (( ! replace )) && [[ ! -f "$dir/audio.orig.wav" ]]; then mv "$dir/audio.wav" "$dir/audio.orig.wav"; fi
+  mv -f "$tmp" "$dir/audio.wav"
+  finalize_audio "$dir"; analyze_levels "$dir"
+  local has_o=false; [[ -f "$dir/audio.orig.wav" ]] && has_o=true
+  update_meta "$dir" '.trim = {from:($f|tonumber), to:($t|tonumber), at:$now, original:$o} | (if .transcript != null then .transcript.stale = true | .transcript.stale_reason = "trim" else . end)' \
+    --arg f "$from" --arg t "$to" --arg now "$(now_iso)" --argjson o "$has_o"
+  # An edited take is not resumable (a restore turns the offer back on).
+  state_set --arg id "$id" '.last_stop |= (if . != null and .id == $id then . + {resumable:false} else . end)'
+  local ndur; ndur=$(jq -r '.duration_s // 0' "$dir/meta.json")
+  log "trim $id ${from}-${to}s -> ${ndur}s replace=$replace original=$has_o"
+  echo "$id ($(fmt_hms "$ndur"))"
+}
+
+cmd_show() {
+  local id="${1:-}"; [[ -n "$id" ]] || die "usage: show <id> [--json]"
+  local as_json=0; want_json "${@:2}" && as_json=1
+  local dir; dir=$(require_dir "$id")
+  if (( as_json )); then rec_json "$dir" --with-text | jq .; else
+    read_meta "$dir" | jq .
+    if [[ -f "$dir/transcript.md" ]]; then echo; cat "$dir/transcript.md"; fi
+  fi
+  return 0
+}
+
+cmd_rename() {
+  local id="${1:-}" title="${2:-}"; [[ -n "$id" ]] || die "usage: rename <id> <title>"
+  local dir; dir=$(require_dir "$id")
+  claim_edit "$id"   # renaming the folder under a live recorder or worker loses the take
+  title=$(sanitize_title "$title")
+  # Folder and meta.json are renamed as a unit: an unreadable meta.json would
+  # fail the title write after the move, leaving the two out of step.
+  jq -e 'type == "object"' "$dir/meta.json" >/dev/null 2>&1 || die "meta.json in $dir is unreadable; not renaming"
+  local new="$ROOT/$id"; [[ -n "$title" ]] && new="$ROOT/$id $title"
+  # A folder already at the new name would swallow the take: plain mv moved it
+  # inside, and the meta write below then failed on the wrong path.
+  if [[ "$new" != "$dir" ]]; then
+    [[ -e "$new" ]] && die "a folder named \"${new##*/}\" already exists; pick another title"
+    mv -T "$dir" "$new"
+  fi
+  update_meta "$new" '.title = $t' --arg t "$title"
+  # A standing resume offer shows the title in the popup; keep it current.
+  state_set --arg id "$id" --arg t "$title" '.last_stop |= (if . != null and .id == $id then . + {title:$t} else . end)'
+  log "rename $id -> '$title'"; echo "$new"
+}
+
+cmd_note() {
+  local id="${1:-}" text="${2:-}"; [[ -n "$id" ]] || die "usage: note <id> <text>"
+  local dir; dir=$(require_dir "$id")
+  # update_meta is an unlocked read-modify-write and the transcribe worker rewrites
+  # meta.json per chunk, so a concurrent note write would be a lost-update race.
+  claim_edit "$id"
+  text=$(sanitize_note "$text")
+  update_meta "$dir" '.notes = $n' --arg n "$text"
+  bump_state; log "note $id (${#text} chars)"; echo "$id"
+}
+
+cmd_delete() {
+  local id="${1:-}" yes=0 permanent=0; [[ -n "$id" ]] || die "usage: delete <id> [--yes] [--permanent]"; shift
+  while [[ $# -gt 0 ]]; do case "$1" in --yes) yes=1 ;; --permanent) permanent=1 ;; *) die "unknown option: $1" ;; esac; shift; done
+  local dir; dir=$(require_dir "$id")
+  claim_edit "$id"   # deleting a folder that is still being recorded or transcribed
+  if (( ! yes )); then
+    [[ -t 0 ]] || die "refusing to delete $id without --yes (no terminal to confirm on)"
+    read -r -p "Delete '$dir'? [y/N] " a; [[ "$a" =~ ^[Yy]$ ]] || exit 1
+  fi
+  local verb=deleted
+  if (( permanent )); then rm -rf "$dir"; log "delete $id (permanent)"
+  elif have gio && gio trash "$dir" 2>>"$LOG_FILE"; then log "delete $id (trash)"; verb=trashed
+  else die "could not move $id to the trash (gio); use --permanent to delete it for good"; fi
+  # whisper's stderr, kept after a failed run, can echo speech: it goes with the take.
+  rm -f "$STATE_DIR/tx-$id.err"
+  # A deleted take can never be resumed; withdraw its offer with it.
+  state_set --arg id "$id" '.last_stop = (if .last_stop != null and .last_stop.id == $id then null else .last_stop end)'
+  echo "$verb $id"
+}
+
+# copy <id> [--print]: transcript text (without the header line) to the clipboard
+cmd_copy() {
+  local id="${1:-}"; [[ -n "$id" ]] || die "usage: copy <id> [--raw] [--print]"; shift
+  local print=0 raw=""
+  while [[ $# -gt 0 ]]; do case "$1" in --print) print=1 ;; --raw) raw=raw ;; *) die "unknown option: $1" ;; esac; shift; done
+  local dir; dir=$(require_dir "$id")
+  [[ -f "$dir/transcript.md" ]] || die "no transcript yet for $id"
+  local f; f=$(transcript_file "$dir" "$raw")
+  if (( print )); then strip_header "$f"; return 0; fi
+  have wl-copy || die "wl-copy not found (install the wl-clipboard package)"
+  strip_header "$f" | wl-copy
+  echo "copied $id"
+}
+
+# --------------------------------------------------------------- export ----
+# "Send to Obsidian": the transcript becomes a Markdown note with YAML
+# frontmatter in the folder where Obsidian itself would file a new note.
+OBSIDIAN_JSON="$XDG_CONFIG_HOME/obsidian/obsidian.json"   # Obsidian's own vault registry
+
+# vault_new_file_location <vault> → newFileLocation from .obsidian/app.json ("" if unset)
+vault_new_file_location() { [[ -f "$1/.obsidian/app.json" ]] && jq -r '.newFileLocation // ""' "$1/.obsidian/app.json" 2>/dev/null; return 0; }
+# vault_folder <vault> → where a new note goes: <vault>/<newFileFolderPath> when
+# Obsidian is set to "folder", the vault root for "root"/"current"/unset.
+vault_folder() {
+  local v="$1" sub=""
+  if [[ "$(vault_new_file_location "$v")" == "folder" ]]; then
+    sub=$(jq -r '.newFileFolderPath // ""' "$v/.obsidian/app.json" 2>/dev/null || true); sub="${sub#/}"; sub="${sub%/}"
+    # A control character (a newline hid a "../" from the check below and cut
+    # the path short when it was read back) or anything that resolves outside
+    # the vault sends the note to the vault root instead.
+    [[ "$sub" == *[[:cntrl:]]* ]] && sub=""
+    if [[ -n "$sub" ]]; then
+      local real vr; real=$(realpath -m -- "$v/$sub"); vr=$(realpath -m -- "$v")
+      [[ "$real" == "$vr"/* ]] || sub=""
+    fi
+    # A synced vault's settings are data: a folder that climbs out of it is ignored.
+    [[ "/$sub/" == *"/../"* ]] && sub=""
+  fi
+  if [[ -n "$sub" ]]; then echo "$v/$sub"; else echo "$v"; fi
+}
+vault_json() { # vault_json <path> <open:true|false> <ts>
+  jq -cn --arg p "$1" --argjson o "$2" --argjson t "$3" --arg loc "$(vault_new_file_location "$1")" --arg f "$(vault_folder "$1")" \
+    '{path:$p, name:($p | split("/") | last), open:$o, ts:$t, newFileLocation:$loc, folder:$f}'
+}
+
+# vaults [--json]: the vaults Obsidian knows about, open one first, then most recent.
+cmd_vaults() {
+  local as_json=0; want_json "$@" && as_json=1
+  local arr='[]' p o t
+  if [[ -f "$OBSIDIAN_JSON" ]]; then
+    while IFS=$'\t' read -r p o t; do
+      p="${p%/}"; [[ -n "$p" && -d "$p" ]] || continue
+      arr=$(jq -c --argjson v "$(vault_json "$p" "$o" "$t")" '. + [$v]' <<<"$arr")
+    done < <(jq -r '.vaults // {} | to_entries[] | .value | [(.path // ""), (.open == true), ((.ts // 0) | tonumber? // 0)] | @tsv' "$OBSIDIAN_JSON" 2>/dev/null || true)
+    arr=$(jq -c 'sort_by((if .open then 0 else 1 end), -.ts)' <<<"$arr")
+  fi
+  if (( as_json )); then jq . <<<"$arr"; return 0; fi
+  if [[ "$arr" == "[]" ]]; then echo "omarecorder: no Obsidian vaults found; open a vault in Obsidian once, then try again" >&2; return 0; fi
+  jq -r '.[] | "\(if .open then "*" else " " end) \(.name)  \(.folder)"' <<<"$arr"
+}
+
+# resolve_export_target <recdir> [--vault P] [--dir P] → "<folder>\t<vault or empty>"
+# --dir wins; then an explicit/configured vault (must exist: never silently
+# another one); then the open/most recent Obsidian vault; then config exportDir;
+# and with no Obsidian at all the note sits next to the recording.
+resolve_export_target() {
+  local recdir="$1" vault="" dir=""; shift
+  while [[ $# -gt 0 ]]; do case "$1" in --vault) need_val "$@"; vault="$2"; shift 2 ;; --dir) need_val "$@"; dir="$2"; shift 2 ;; *) die "unknown option: $1" ;; esac; done
+  if [[ -n "$dir" ]]; then printf '%s\t\n' "${dir/#\~/$HOME}"; return 0; fi
+  [[ -n "$vault" ]] || vault=$(cfg obsidianVault)
+  if [[ -n "$vault" ]]; then
+    vault="${vault/#\~/$HOME}"; vault="${vault%/}"
+    [[ -d "$vault" ]] || die "vault not found: $vault"
+    printf '%s\t%s\n' "$(vault_folder "$vault")" "$vault"; return 0
+  fi
+  # A configured exportDir is a decision the user made; an autodetected vault is
+  # a guess this script made. The decision wins, or exportDir could never take
+  # effect on any machine that has Obsidian installed.
+  local ed; ed=$(cfg exportDir)
+  if [[ -n "$ed" ]]; then printf '%s\t\n' "${ed/#\~/$HOME}"; return 0; fi
+  local first; first=$(cmd_vaults --json | jq -r '.[0] | select(. != null) | [.folder, .path] | @tsv')
+  if [[ -n "$first" ]]; then printf '%s\n' "$first"; return 0; fi
+  printf '%s\t\n' "$recdir"
+}
+
+# note_stem <title> <created> → file name (without .md) Obsidian accepts:
+# its illegal characters * " \ / < > : | ? # ^ [ ] become "-".
+note_stem() {
+  local t; t=$(sanitize_title "$1" | tr '*"\\/<>:|?#^[]' '-' | sed -E 's/ +/ /g; s/^ //; s/ $//')
+  [[ -n "$t" ]] || t="Recording ${2:0:10} ${2:11:2}-${2:14:2}"
+  printf '%s' "$t"
+}
+
+# export <id> [--vault P | --dir P] [--no-open] [--raw]: write the note, remember where, open it in Obsidian
+cmd_export() {
+  local id="${1:-}"; [[ -n "$id" ]] || die "usage: export <id> [--vault P | --dir P] [--no-open] [--raw]"; shift
+  local -a target=(); local open=1 raw=""
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --vault|--dir) need_val "$@"; [[ -n "$2" ]] || die "$1 needs a path"; target+=("$1" "$2"); shift 2 ;;
+      --no-open) open=0; shift ;;
+      --raw) raw=raw; shift ;;
+      *) die "unknown option: $1" ;;
+    esac
+  done
+  local dir; dir=$(require_dir "$id")
+  [[ -f "$dir/transcript.md" ]] || die "no transcript yet for $id"
+  local f; f=$(transcript_file "$dir" "$raw")
+  local line folder vault; line=$(resolve_export_target "$dir" "${target[@]}")
+  IFS=$'\t' read -r folder vault <<<"$line"
+  mkdir -p "$folder" || die "cannot create $folder"
+  local meta title created; meta=$(read_meta "$dir")
+  title=$(jq -r '.title // ""' <<<"$meta"); created=$(jq -r '.created // ""' <<<"$meta")
+  local notes; notes=$(jq -r '.notes // ""' <<<"$meta")
+  local stem path n=1; stem=$(note_stem "$title" "$created"); path="$folder/$stem.md"
+  while [[ -e "$path" ]]; do n=$((n+1)); path="$folder/$stem ($n).md"; done
+  local src; case "$(jq -r '.source // ""' <<<"$meta")" in
+    mic) src="microphone" ;; system) src="system audio" ;; both) src="mic + system audio" ;; *) src="imported" ;; esac
+  local model; model=$(jq -r '.transcript.model // ""' <<<"$meta"); [[ -n "$model" ]] || model='""'
+  # mktemp: created exclusively, so a link planted at a guessable name inside
+  # a synced vault cannot redirect the write (a vault's contents are data).
+  local tmp; tmp=$(mktemp -- "$folder/.omarecorder.XXXXXX") || die "could not write in $folder"
+  { printf -- '---\n'
+    printf 'title: %s\n' "$(jq -cn --arg t "$title" '$t')"
+    printf 'date: %s\n' "$created"
+    printf 'duration: %s\n' "$(fmt_hms "$(jq -r '.duration_s // 0' <<<"$meta")")"
+    printf 'source: %s\n' "$src"
+    printf 'model: %s\n' "$model"
+    # The recording's note (a session recap, say) as a property, JSON-quoted
+    # like the title so any character survives as valid YAML.
+    [[ -n "$notes" ]] && printf 'note: %s\n' "$(jq -cn --arg n "$notes" '$n')"
+    printf 'omarecorder: %s\n' "$id"
+    [[ $(jq -r '.transcript.partial // false' <<<"$meta") == "true" ]] && printf 'partial: true\n'
+    [[ $(jq -r '.transcript.stale // false' <<<"$meta") == "true" ]] && printf 'stale: true\n'
+    printf 'tags: [omarecorder]\n'
+    printf -- '---\n\n'
+    strip_header "$f"
+  } > "$tmp" && mv -f "$tmp" "$path" || { rm -f "$tmp"; die "could not write $path"; }
+  # exported_vault tells the Library whether "in Obsidian" is true: without a
+  # vault the note went to exportDir or next to the recording.
+  update_meta "$dir" '.exported_to = $p | .exported_at = $t | .exported_vault = ($v != "")' --arg p "$path" --arg t "$(now_iso)" --arg v "$vault"
+  bump_state
+  local ttl="${title:-$id}"
+  if [[ -n "$vault" ]]; then
+    if (( open )) && have xdg-open; then
+      setsid xdg-open "obsidian://open?path=$(jq -rn --arg p "$path" '$p | @uri')" >/dev/null 2>&1 </dev/null &
+    fi
+    local rel="${folder#"$vault"}"; rel="${rel#/}"
+    notify "Sent to Obsidian · $ttl" "$(basename "$vault")${rel:+/$rel}"
+  else
+    notify "Transcript exported · $ttl" "$path"
+  fi
+  log "export $id -> $path"
+  echo "$path"
+}
+
+# ------------------------------------------------------------------ tidy ----
+# tidy_transcript <dir>: transcript.md -> transcript.tidy.md. Local and
+# deterministic: collapse phrases whisper repeated back to back (its "loops"),
+# then lay the words out in paragraphs at sentence ends, with every piece
+# boundary (blank line) kept as a paragraph break. The raw file is never touched.
+# ----------------------------------------------------------- dictionary ----
+# A plain-text corrections list applied by tidy: literal, case-insensitive,
+# whole-word/phrase substitutions for things whisper reliably mishears.
+# The file is the user's; it is seeded once with a starter set and never
+# rewritten by the app afterwards (add/import only append).
+seed_dictionary() {
+  [[ -f "$DICT_FILE" ]] && return 0
+  mkdir -p "$CONFIG_DIR"
+  cat > "$DICT_FILE" <<'SEED'
+# OmaRecorder dictionary: corrections applied to tidy transcripts.
+# One per line:   what whisper wrote -> what you meant
+# Matching is literal, case-insensitive, whole words/phrases only. No regex.
+# Rule of thumb: never map a word that could be ordinary English on its own
+# ("cash", "get", "pseudo"); use a longer phrase instead ("get push -> git push").
+# Your favorite LLM can extend this list: omarecorder dictionary prompt --copy
+
+# Omarchy and friends
+omarkey -> Omarchy
+oma record -> OmaRecorder
+omarecord -> OmaRecorder
+hyperland -> Hyprland
+hyper land -> Hyprland
+quick shell -> Quickshell
+vox type -> voxtype
+way bar -> Waybar
+pipe wire -> PipeWire
+system d -> systemd
+
+# Terminal talk
+cube control -> kubectl
+cube cuttle -> kubectl
+engine x -> nginx
+neo vim -> Neovim
+dot files -> dotfiles
+clawed code -> Claude Code
+get push -> git push
+get pull -> git pull
+get commit -> git commit
+get checkout -> git checkout
+get check out -> git checkout
+
+# Around the table
+owl bear -> owlbear
+bug beer -> bugbear
+typhling -> tiefling
+tifling -> tiefling
+never winter -> Neverwinter
+Faerun -> Faerûn
+Peller -> Pelor
+katan -> Catan
+gloom haven -> Gloomhaven
+plains walker -> planeswalker
+
+# Gamer to gamer
+speed run -> speedrun
+speed running -> speedrunning
+speed runner -> speedrunner
+theory crafting -> theorycrafting
+min maxing -> min-maxing
+min maxed -> min-maxed
+SEED
+}
+
+# dict_entries: the parsed entries as "heard -> written" lines, one per entry,
+# whitespace normalized. The single source of truth for what counts as an
+# entry; list/count/prompt/import all go through it.
+dict_entries() {
+  [[ -f "$DICT_FILE" ]] || return 0
+  awk '
+    { sub(/\r$/, "") }
+    /^[[:space:]]*(#|$)/ { next }
+    { p = index($0, " -> "); if (p == 0) next
+      h = substr($0, 1, p - 1); w = substr($0, p + 4)
+      gsub(/^[[:space:]]+|[[:space:]]+$/, "", h); gsub(/^[[:space:]]+|[[:space:]]+$/, "", w)
+      gsub(/[[:space:]]+/, " ", h); gsub(/[[:space:]]+/, " ", w)
+      if (h != "" && w != "") printf "%s -> %s\n", h, w }
+  ' "$DICT_FILE"
+}
+dict_count() { dict_entries | wc -l; }
+
+# DICT_AWK: applies the entries to header-stripped transcript text, piece by
+# piece (blank-line blocks), so a phrase split across raw lines still matches.
+# Longest heard form wins; boundaries are non-alphanumeric, so possessives
+# ("peller's") match and words inside longer words ("speed running" for the
+# "speed run" entry) do not. Replacement text is emitted verbatim and is never
+# rescanned by the entry that produced it.
+read -r -d '' DICT_AWK <<'AWK' || true
+BEGIN {
+  n = 0
+  while ((getline line < dictfile) > 0) {
+    sub(/\r$/, "", line)
+    if (line ~ /^[[:space:]]*(#|$)/) continue
+    p = index(line, " -> "); if (p == 0) continue
+    h = substr(line, 1, p - 1); w = substr(line, p + 4)
+    gsub(/^[[:space:]]+|[[:space:]]+$/, "", h); gsub(/^[[:space:]]+|[[:space:]]+$/, "", w)
+    gsub(/[[:space:]]+/, " ", h); gsub(/[[:space:]]+/, " ", w)
+    if (h == "" || w == "") continue
+    n++; heard[n] = tolower(h); wr[n] = w; hl[n] = length(h)
+  }
+  close(dictfile)
+  for (i = 1; i < n; i++) for (j = i + 1; j <= n; j++)
+    if (hl[j] > hl[i]) { t = heard[i]; heard[i] = heard[j]; heard[j] = t
+                         t = wr[i]; wr[i] = wr[j]; wr[j] = t
+                         u = hl[i]; hl[i] = hl[j]; hl[j] = u }
+}
+function isword(c) { return c ~ /[A-Za-z0-9]/ }
+function fix(s,   i, lc, pos, off, pre, post, acc) {
+  for (i = 1; i <= n; i++) {
+    lc = tolower(s); off = 1; acc = ""
+    while ((pos = index(substr(lc, off), heard[i])) > 0) {
+      pos += off - 1
+      pre = (pos > 1) ? substr(s, pos - 1, 1) : " "
+      post = substr(s, pos + hl[i], 1); if (post == "") post = " "
+      if (!isword(pre) && !isword(post)) {
+        acc = acc substr(s, off, pos - off) wr[i]
+        off = pos + hl[i]; reps++
+      } else {
+        acc = acc substr(s, off, pos - off + 1)
+        off = pos + 1
+      }
+    }
+    s = acc substr(s, off)
+  }
+  return s
+}
+function flushp() { if (piece != "") { gsub(/[[:space:]]+/, " ", piece); print fix(piece); piece = "" } }
+/^[[:space:]]*$/ { flushp(); print ""; next }
+{ piece = piece " " $0 }
+END { flushp(); print reps + 0 > statsfile }
+AWK
+
+cmd_dictionary() {
+  local sub="${1:-list}"; shift || true
+  case "$sub" in
+    list|--json)
+      seed_dictionary
+      # The non-greedy heard capture splits at the FIRST arrow, matching the
+      # engine and the human list; trailing --json follows the house shape.
+      if [[ "$sub" == "--json" || "${1:-}" == "--json" ]]; then
+        dict_entries | jq -Rn --arg file "$DICT_FILE" \
+          '{file: $file, entries: [inputs | capture("^(?<heard>.*?) -> (?<written>.*)$")], count: 0} | .count = (.entries | length)'
+      else dict_entries; fi ;;
+    add)
+      local h="${1:-}" w="${2:-}"
+      h=$(tr -s '[:space:]' ' ' <<<"$h"); h="${h# }"; h="${h% }"
+      w=$(tr -s '[:space:]' ' ' <<<"$w"); w="${w# }"; w="${w% }"
+      [[ -n "$h" && -n "$w" ]] || die "usage: dictionary add <heard> <written>"
+      [[ "$h" != *" -> "* && "$w" != *" -> "* ]] || die "entries cannot contain \" -> \""
+      seed_dictionary
+      local lc_h="${h,,}"
+      if dict_entries | awk -v h="$lc_h" 'tolower(substr($0, 1, index($0, " -> ") - 1)) == h { found = 1 } END { exit !found }'; then
+        die "\"$h\" is already in the dictionary; edit the file to change it"
+      fi
+      printf '%s -> %s\n' "$h" "$w" >> "$DICT_FILE"
+      bump_state; echo "added: $h -> $w" ;;
+    edit)
+      seed_dictionary
+      if have omarchy-launch-editor; then
+        omarchy-launch-editor "$DICT_FILE"
+      elif have xdg-open; then
+        setsid xdg-open "$DICT_FILE" >/dev/null 2>&1 < /dev/null &
+      else
+        die "no editor launcher found (install Omarchy or xdg-utils); the file is $DICT_FILE"
+      fi
+      echo "$DICT_FILE" ;;
+    prompt)
+      seed_dictionary
+      { cat <<'P1'
+You're helping me extend a speech-to-text corrections dictionary. My recorder
+transcribes locally with Whisper, then applies these fixes. Format: one per
+line, `what whisper wrote -> what I meant`. Matching is literal,
+case-insensitive, whole-word/whole-phrase; no regex.
+
+Safety rule: only suggest entries whose left side would essentially never
+appear as ordinary English ("plains walker" is safe; "cash" is not, even
+though I mean "cache"). Defuse homophones with longer phrases
+("get push -> git push", never "get -> git").
+
+If the "I talk about" line below still shows bracketed placeholder text, stop
+and ask me what I talk about before suggesting anything.
+
+My current dictionary:
+P1
+        dict_entries
+        cat <<'P2'
+
+I talk about: [describe your hobbies, campaign and character names, projects, coworkers]
+
+Reply with new entries only, one per line, exactly in the format above, no commentary.
+P2
+      } | if [[ "${1:-}" == "--copy" ]]; then
+        have wl-copy || die "wl-copy not found (install the wl-clipboard package)"
+        wl-copy; echo "prompt copied to the clipboard"
+      else cat; fi ;;
+    export)
+      seed_dictionary
+      if [[ -n "${1:-}" ]]; then cp -- "$DICT_FILE" "$1" 2>/dev/null || die "cannot write $1"; echo "$1"; else cat "$DICT_FILE"; fi ;;
+    import)
+      local srcdesc="${1:-}"; [[ -n "$srcdesc" ]] || die "usage: dictionary import <file|--clipboard>"
+      seed_dictionary
+      local tmp="$RUN_DIR/dict.import.$$"; mkdir -p "$RUN_DIR"
+      if [[ "$srcdesc" == "--clipboard" ]]; then
+        have wl-paste || die "wl-paste not found (install the wl-clipboard package)"
+        wl-paste > "$tmp" || { rm -f "$tmp"; die "clipboard is empty"; }
+      else
+        [[ -f "$srcdesc" ]] || die "no such file: $srcdesc"
+        cp -- "$srcdesc" "$tmp"
+      fi
+      # Existing entries, keyed by lowercased heard form. Pure bash per line
+      # (${h,,}, parameter replaces): a subshell per line made a 5,000-line
+      # import take ~47 s.
+      declare -A have_w=()
+      local line h w lc_h lineno=0 added=0 dups=0 conflicts=0 badlines=()
+      while IFS= read -r line; do
+        h="${line%% -> *}"; w="${line#* -> }"
+        lc_h="${h,,}"; have_w["$lc_h"]="$w"
+      done < <(dict_entries)
+      local out=""
+      while IFS= read -r line || [[ -n "$line" ]]; do
+        lineno=$((lineno + 1)); line="${line%$'\r'}"
+        [[ "$line" =~ ^[[:space:]]*(#|$) ]] && continue
+        if [[ "$line" != *" -> "* ]]; then badlines+=("$lineno"); continue; fi
+        h="${line%% -> *}"; w="${line#* -> }"
+        h="${h//$'\t'/ }"; while [[ "$h" == *'  '* ]]; do h="${h//  / }"; done; h="${h# }"; h="${h% }"
+        w="${w//$'\t'/ }"; while [[ "$w" == *'  '* ]]; do w="${w//  / }"; done; w="${w# }"; w="${w% }"
+        if [[ -z "$h" || -z "$w" ]]; then badlines+=("$lineno"); continue; fi
+        lc_h="${h,,}"
+        if [[ -n "${have_w[$lc_h]:-}" ]]; then
+          if [[ "${have_w[$lc_h]}" == "$w" ]]; then dups=$((dups + 1)); else conflicts=$((conflicts + 1)); fi
+          continue
+        fi
+        have_w["$lc_h"]="$w"; out+="$h -> $w"$'\n'; added=$((added + 1))
+      done < "$tmp"
+      rm -f "$tmp"
+      (( added + dups + conflicts > 0 )) || die "nothing usable to import"
+      [[ -n "$out" ]] && printf '%s' "$out" >> "$DICT_FILE"
+      local summary="$added added, $dups duplicates skipped, $conflicts conflicts kept yours"
+      if (( ${#badlines[@]} == 1 )); then summary+=", 1 malformed (line ${badlines[0]})"
+      elif (( ${#badlines[@]} > 1 )); then local bl; bl=$(printf '%s, ' "${badlines[@]}"); summary+=", ${#badlines[@]} malformed (lines ${bl%, })"; fi
+      (( added > 0 )) && bump_state
+      echo "$summary" ;;
+    *) die "usage: dictionary [--json] | add <heard> <written> | edit | prompt [--copy] | export [path] | import <file|--clipboard>" ;;
+  esac
+}
+
+read -r -d '' TIDY_AWK <<'AWK' || true
+function norm(w) { w = tolower(w); gsub(/[^a-z0-9]/, "", w); return (w == "" ? "-" : w) }
+function block_eq(a, b, N,   k) { for (k = 0; k < N; k++) if (nt[a+k] != nt[b+k]) return 0; return 1 }
+function endpara() { if (cur != "") { out = out (out == "" ? "" : "\n\n") cur; paras++ } cur = ""; cnt = 0 }
+function emit(w) {
+  cur = (cur == "" ? w : cur " " w); cnt++
+  if (cnt >= para_words && w ~ endre) endpara()
+  else if (cnt >= hard_words) endpara()
+}
+function flush_piece(   n, m, i, j, k, N, matched, t, reps, run, last, punct) {
+  n = split(piece, t, /[[:space:]]+/); m = 0
+  for (i = 1; i <= n; i++) if (t[i] != "") { m++; tt[m] = t[i]; nt[m] = norm(t[i]) }
+  n = m; i = 1
+  while (i <= n) {
+    matched = 0
+    for (N = maxN; N >= minN; N--) {
+      if (i + 2*N - 1 <= n && block_eq(i, i + N, N)) {
+        j = i + N
+        while (j + N - 1 <= n && block_eq(i, j, N)) j += N
+        removed += (j - i - N)
+        # The reader should see where text was collapsed, so the last kept
+        # word of the block carries a "(repeated Nx)" marker; riding on a word
+        # means it can never orphan at a paragraph break. The composite token
+        # counts as one word toward the paragraph limits, an accepted skew.
+        # Terminal punctuation moves after the marker ("door (repeated 4x).")
+        # so emit() still sees the sentence end and paragraphing is unchanged.
+        reps = (j - i) / N
+        run = j - i - N; if (run > longest) longest = run
+        loops++
+        for (k = i; k < i + N - 1; k++) emit(tt[k])
+        last = tt[i+N-1]; punct = ""
+        if (match(last, endre)) { punct = substr(last, RSTART); last = substr(last, 1, RSTART - 1) }
+        if (last != "") emit(last " (repeated " reps "x)" punct)
+        else emit("(repeated " reps "x)" punct)
+        i = j; matched = 1; break
+      }
+    }
+    if (!matched) { emit(tt[i]); i++ }
+  }
+  endpara(); piece = ""; delete tt; delete nt
+}
+# Loops of phrases under minN (4) normalized words are invisible to tidy and
+# can never be marked or flagged.
+# endre: a sentence-ending word (end punctuation, then any closing quotes or
+# brackets). The single quote arrives in sq (-v) so the program text has none:
+# kcov cannot trace a bash word that holds both a newline and a single quote.
+BEGIN { minN = 4; maxN = 14; para_words = 90; hard_words = 220; endre = "[.!?][\"" sq ")\\]]*$" }
+/^[[:space:]]*$/ { flush_piece(); next }
+{ piece = piece " " $0 }
+END { flush_piece(); printf "%s\n", out; print paras + 0, removed + 0, loops + 0, longest + 0 > statsfile }
+
+AWK
+tidy_transcript() {
+  local dir="$1" paras removed loops longest dreps=0
+  local src="$dir/transcript.md" out="$dir/transcript.tidy.md" stats="$RUN_DIR/tidy.$$.stats" dstats="$RUN_DIR/dict.$$.stats"
+  [[ -s "$src" ]] || return 0
+  mkdir -p "$RUN_DIR"
+  seed_dictionary
+  if (( $(dict_count) > 0 )); then
+    if ! strip_header "$src" | awk -v dictfile="$DICT_FILE" -v statsfile="$dstats" "$DICT_AWK" \
+        | awk -v sq="'" -v statsfile="$stats" "$TIDY_AWK" > "$out.tmp.$$"; then
+      rm -f "$out.tmp.$$" "$stats" "$dstats"; log "tidy failed in $dir"; return 0
+    fi
+    read -r dreps < "$dstats" 2>/dev/null || dreps=0; rm -f "$dstats"
+    [[ "$dreps" =~ ^[0-9]+$ ]] || dreps=0
+  else
+    if ! strip_header "$src" | awk -v sq="'" -v statsfile="$stats" "$TIDY_AWK" > "$out.tmp.$$"; then rm -f "$out.tmp.$$" "$stats"; log "tidy failed in $dir"; return 0; fi
+  fi
+  read -r paras removed loops longest < "$stats"; rm -f "$stats"
+  # loop_warning: one single collapse removed at least this many words. maxN is
+  # 14, so a legitimate re-utterance removes at most 14 words and even a triple
+  # at most 28; 40 needs a genuine whisper loop.
+  local lw="${OMARECORDER_LOOP_WARN_WORDS:-40}"
+  [[ "$lw" =~ ^[0-9]+$ ]] || lw=40
+  # Built beside the file and renamed into place: written in place, a reader
+  # (list, search, the Library) could catch it half-written.
+  { printf '<!-- omarecorder tidy: %s paragraphs, %s repeated words removed, %s loops, created=%s -->\n' "$paras" "$removed" "$loops" "$(now_iso)"; cat "$out.tmp.$$"; } > "$out.new.tmp.$$" \
+    && mv -f "$out.new.tmp.$$" "$out"
+  rm -f "$out.tmp.$$" "$out.new.tmp.$$"
+  update_meta "$dir" '.transcript = ((.transcript // {}) + {tidy:{paragraphs:$p, repeats_removed:$r, loops:$l, longest_run_words:$g, loop_warning:($g >= $w), dict_replacements:$dr, created:$c}})' \
+    --argjson p "$paras" --argjson r "$removed" --argjson l "$loops" --argjson g "$longest" --argjson w "$lw" --argjson dr "$dreps" --arg c "$(now_iso)" || true
+}
+
+cmd_tidy() { # tidy <id>: (re)build transcript.tidy.md
+  local id="${1:-}"; [[ -n "$id" ]] || die "usage: tidy <id>"
+  local dir; dir=$(require_dir "$id")
+  [[ -s "$dir/transcript.md" ]] || die "no transcript yet for $id"
+  tidy_transcript "$dir"; bump_state
+  jq -c '.transcript.tidy' "$dir/meta.json"
+}
+
+# transcript_file <dir> [raw]: the tidy transcript when there is one, else the raw
+transcript_file() { if [[ "${2:-}" != "raw" && -s "$1/transcript.tidy.md" ]]; then echo "$1/transcript.tidy.md"; else echo "$1/transcript.md"; fi; }
+
+# --------------------------------------------------------------- models ----
+model_installed() { [[ -f "$VOXTYPE_MODELS_DIR/ggml-$1.bin" ]]; }
+model_catalog_has() { jq -e --arg m "$1" 'any(.[]; .name == $m)' <<<"$MODEL_CATALOG" >/dev/null; }
+model_known() { model_catalog_has "$1" || model_installed "$1"; }
+discover_installed_models() {
+  local f name
+  shopt -s nullglob
+  for f in "$VOXTYPE_MODELS_DIR"/ggml-*.bin; do
+    name=${f##*/}; name=${name#ggml-}; name=${name%.bin}
+    [[ "$name" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]] && printf '%s\n' "$name"
+  done | sort -u
+}
+model_label() { # "Fast (base.en)" or just the name
+  local l; l=$(jq -r --arg m "$1" '.[] | select(.name==$m) | .label' <<<"$MODEL_CATALOG")
+  [[ -n "$l" ]] && echo "$l ($1)" || echo "$1"
+}
+model_rtf() { # measured or default
+  local m="$1" v=""
+  [[ -f "$BENCH_FILE" ]] && v=$(jq -r --arg m "$m" '.[$m].rtf // empty' "$BENCH_FILE" 2>/dev/null)
+  [[ -n "$v" ]] && { echo "$v"; return 0; }
+  v=$(jq -r --arg m "$m" '.[] | select(.name==$m) | .rtf // empty' <<<"$MODEL_CATALOG")
+  echo "${v:-3}"
+}
+cmd_models() {
+  local as_json=0; want_json "$@" && as_json=1
+  local bench='{}'; [[ -f "$BENCH_FILE" ]] && bench=$(jq -c . "$BENCH_FILE")
+  local out; out=$(jq -c --arg mdir "$VOXTYPE_MODELS_DIR" --argjson bench "$bench" --arg def "$(cfg defaultModel)" '
+    map(. + {installed: false, default: (.name == $def), rtf_source: "default"}
+        | if $bench[.name] then .rtf = $bench[.name].rtf | .rtf_source = "measured" else . end)' <<<"$MODEL_CATALOG")
+  local res='[]' m name
+  while IFS= read -r m; do
+    name=$(jq -r '.name' <<<"$m")
+    if model_installed "$name"; then m=$(jq -c '.installed=true' <<<"$m"); fi
+    res=$(jq -c --argjson m "$m" '. + [$m]' <<<"$res")
+  done < <(jq -c '.[]' <<<"$out")
+  # The catalog supplies optional metadata. The files installed by Voxtype
+  # are the source of truth for what can actually be selected.
+  while IFS= read -r name; do
+    [[ -n "$name" ]] || continue
+    jq -e --arg n "$name" '.[] | select(.name == $n)' <<<"$res" >/dev/null && continue
+    local bytes size_mb
+    bytes=$(stat -c %s "$VOXTYPE_MODELS_DIR/ggml-$name.bin" 2>/dev/null || echo 0)
+    size_mb=$(( (bytes + 999999) / 1000000 ))
+    m=$(jq -cn --arg n "$name" --argjson size "$size_mb" '{name:$n, size_mb:$size, rtf:3, label:null,
+      installed:true, default:false, rtf_source:"default"}')
+    res=$(jq -c --argjson m "$m" '. + [$m]' <<<"$res")
+  done < <(discover_installed_models)
+  if (( as_json )); then jq . <<<"$res"; return 0; fi
+  jq -r '.[] | "\(if .installed then "✓" else " " end) \(.name)\t\(.size_mb) MB\t~\(.rtf)x realtime (\(.rtf_source))\t\(.label)"' <<<"$res"
+}
+
+cmd_model() {
+  local sub="${1:-}"; shift || true
+  case "$sub" in
+    download)
+      local name="${1:-}"; [[ -n "$name" ]] || die "usage: model download <name>"
+      start_download "$name" "" ;;
+    cancel)
+      local name="${1:-}"; [[ -n "$name" ]] || die "usage: model cancel <name>"
+      jq -e --arg m "$name" '.[] | select(.name==$m)' <<<"$MODEL_CATALOG" >/dev/null || die "unknown model: $name"
+      local unit="omarecorder-dl-${name//./-}" was=0
+      unit_active "$unit" && was=1
+      systemctl --user stop "$unit" 2>/dev/null || true
+      systemctl --user reset-failed "$unit" 2>/dev/null || true
+      # The killed worker can never remove its own job; take the job (and any
+      # parked chained transcription) out of the state ourselves, atomically.
+      # Partial .bin.part files stay: voxtype owns its model dir and may resume.
+      local then_json; then_json=$(with_lock _take_dl_then "$name") || then_json=""
+      bump_state
+      if (( was )) || [[ -n "$then_json" ]]; then
+        if [[ -n "$then_json" ]]; then
+          local tid d ttl=""; tid=$(jq -r '.id // empty' <<<"$then_json")
+          # The || guard sits outside the substitution: rec_dir dies (exits the
+          # subshell) on a malformed id, so an inner || true would never run.
+          d=$(rec_dir "$tid" 2>/dev/null) || d=""
+          [[ -n "$d" ]] && ttl=$(jq -r '.title // empty' "$d/meta.json" 2>/dev/null); ttl="${ttl:-$tid}"
+          notify "Download cancelled · $(model_label "$name")" "The queued transcription of $ttl was dropped"
+        else
+          notify "Download cancelled · $(model_label "$name")" "You can start it again any time"
+        fi
+        log "download cancelled $name"
+      fi
+      echo "cancelled $name" ;;
+    *) die "usage: model download <name> | model cancel <name>" ;;
+  esac
+}
+
+# start_download <name> <then_json>: shared starter for `model download` and
+# `transcribe --download`. A non-empty then_json ({id, language, threads})
+# chains a transcription onto the finished download; empty means plain.
+start_download() {
+  local name="$1" then_json="${2:-}"
+  jq -e --arg m "$name" '.[] | select(.name==$m)' <<<"$MODEL_CATALOG" >/dev/null || die "unknown model: $name"
+  model_installed "$name" && { echo "already installed: $name"; return 0; }
+  have voxtype || die "voxtype not installed"
+  reconcile_state
+  local unit="omarecorder-dl-${name//./-}" size rc=0
+  size=$(jq -r --arg m "$name" '.[] | select(.name==$m) | .size_mb' <<<"$MODEL_CATALOG")
+  with_lock _claim_dl "$name" "$then_json" "$unit" $((size * 1000000)) || rc=$?
+  case "$rc" in
+    1) die "download already running" ;;
+    2) log "model download $name: chained transcribe re-aimed"; echo "downloading $name"; return 0 ;;
+  esac
+  if ! run_detached "$unit" "OmaRecorder download $name" "$SELF" _dl-worker "$name"; then
+    state_set --arg m "$name" '.jobs |= map(select(.type != "download" or .model != $m))'
+    die "could not start the download"
+  fi
+  log "model download $name ($unit)"; echo "downloading $name"
+}
+
+# run_detached <unit> <description> <cmd...>: systemd-run (or inline when OMARECORDER_SYNC=1)
+run_detached() {
+  local unit="$1" desc="$2"; shift 2
+  if [[ "${OMARECORDER_SYNC:-0}" == "1" ]] || ! have systemd-run; then "$@"; return $?; fi
+  systemd-run --user --quiet --no-block --collect --service-type=oneshot -u "$unit" --description="$desc" \
+    --setenv=OMARECORDER_DIR="${OMARECORDER_DIR:-}" --setenv=XDG_CONFIG_HOME="$XDG_CONFIG_HOME" --setenv=HOME="$HOME" \
+    --setenv=XDG_STATE_HOME="$XDG_STATE_HOME" --setenv=XDG_RUNTIME_DIR="$XDG_RUNTIME_DIR" --setenv=OMARECORDER_RUN_DIR="${OMARECORDER_RUN_DIR:-}" --setenv=VOXTYPE_MODELS_DIR="$VOXTYPE_MODELS_DIR" \
+    --setenv=OMARECORDER_QUIET="${OMARECORDER_QUIET:-0}" --setenv=OMARECORDER_CHUNK_S="${OMARECORDER_CHUNK_S:-}" \
+    --setenv=OMARECORDER_LOOP_WARN_WORDS="${OMARECORDER_LOOP_WARN_WORDS:-}" --setenv=PATH="$PATH" "$@"
+}
+
+_dl_worker() {
+  local name="$1" b; local f="$VOXTYPE_MODELS_DIR/ggml-$name.bin"
+  # model cancel stops the unit and owns the job removal; a TERM here is a
+  # clean exit, not a failure (mirrors _tx_worker's trap contract).
+  trap 'exit 0' TERM INT HUP
+  voxtype setup --download --model "$name" --quiet --no-post-install >>"$LOG_FILE" 2>&1 &
+  local child=$!
+  # Progress = bytes on disk, published into the job entry every 2 s (the UI
+  # only watches state.json; nothing polls the model directory).
+  while pid_alive "$child"; do
+    sleep 2; b=0; [[ -f "$f" ]] && b=$(file_size "$f"); [[ -f "$f.part" ]] && b=$(file_size "$f.part")
+    state_set --arg m "$name" --argjson b "$b" '.jobs |= map(if .type=="download" and .model==$m then .bytes_done=$b else . end)' || true
+  done
+  local ok=0; wait "$child" && model_installed "$name" && ok=1
+  # Take the chain intent and drop our own job atomically (transcribe
+  # --download may have re-aimed the intent right up to this moment).
+  # cmd_list never reconciles, so a job left behind kept the UI saying
+  # "Downloading model..." until some other command happened to run.
+  local then_json; then_json=$(with_lock _take_dl_then "$name") || then_json=""
+  if (( ok )); then
+    log "download ok $name"
+    if [[ -n "$then_json" ]]; then
+      local tid tlang tthreads tfrom tto err
+      tid=$(jq -r '.id // empty' <<<"$then_json"); tlang=$(jq -r '.language // empty' <<<"$then_json"); tthreads=$(jq -r '.threads // empty' <<<"$then_json")
+      tfrom=$(jq -r '.from // empty' <<<"$then_json"); tto=$(jq -r '.to // empty' <<<"$then_json")
+      local tchunk; tchunk=$(jq -r '.chunk_s // empty' <<<"$then_json")
+      local tenh; tenh=$(jq -r '.enhance // empty' <<<"$then_json")
+      local -a targs=(transcribe "$tid" --model "$name")
+      [[ -n "$tlang" ]] && targs+=(--language "$tlang")
+      [[ -n "$tthreads" ]] && targs+=(--threads "$tthreads")
+      [[ -n "$tfrom" ]] && targs+=(--from "$tfrom")
+      [[ -n "$tto" ]] && targs+=(--to "$tto")
+      [[ -n "$tchunk" ]] && targs+=(--chunk-s "$tchunk")
+      # The choice was resolved when the intent was parked; replay it as is.
+      [[ "$tenh" == "true" ]] && targs+=(--enhance)
+      [[ "$tenh" == "false" ]] && targs+=(--no-enhance)
+      if err=$("$SELF" "${targs[@]}" 2>&1 >/dev/null); then
+        local d ttl=""; d=$(rec_dir "$tid" 2>/dev/null) && ttl=$(jq -r '.title // empty' "$d/meta.json" 2>/dev/null); ttl="${ttl:-$tid}"
+        notify "Model ready · $(model_label "$name")" "Transcribing $ttl now"; log "download chained transcribe $tid"
+      else
+        err="${err%%$'\n'*}"
+        notify "Model ready · $(model_label "$name")" "The transcription could not start: ${err:-unknown error}"
+        log "download chain FAILED $name -> $tid: ${err:-unknown error}"
+      fi
+    else
+      notify "Model ready · $(model_label "$name")" "You can pick it in the Library now"
+    fi
+  else
+    # The notification is easy to miss; the Library reads this and says so
+    # beside the button until the next attempt.
+    state_set --arg m "$name" --argjson t "$(now_epoch)" '.download_failed = {model:$m, at:$t}' || true
+    notify "Model download failed · $name" "Check your connection and try again (details: $LOG_FILE)"; log "download FAILED $name"
+  fi
+  bump_state
+}
+
+cmd_estimate() {
+  local id="${1:-}" model=""; [[ -n "$id" ]] || die "usage: estimate <id> [--model <name>]"
+  shift
+  while [[ $# -gt 0 ]]; do
+    case "$1" in --model) need_val "$@"; model="$2"; shift 2 ;; *) die "unknown option: $1" ;; esac
+  done
+  model="${model:-$(cfg defaultModel)}"
+  model_known "$model" || die "unknown model: $model (not in catalog or installed models)"
+  local dir; dir=$(require_dir "$id")
+  local dur rtf src="default"; dur=$(jq -r '.duration_s // 0' "$dir/meta.json"); rtf=$(model_rtf "$model")
+  [[ -f "$BENCH_FILE" ]] && jq -e --arg m "$model" '.[$m]' "$BENCH_FILE" >/dev/null 2>&1 && src="measured"
+  jq -cn --arg m "$model" --argjson d "$dur" --argjson r "$rtf" --arg s "$src" '{model:$m, duration_s:$d, rtf:$r, seconds:(($d / $r) | ceil), source:$s}'
+}
+
+# ----------------------------------------------------------- transcribe ----
+cmd_transcribe() {
+  local id="${1:-}"; [[ -n "$id" ]] || die "usage: transcribe <id> [--model M] [--language L] [--threads N] [--from s --to s] [--chunk-s N] [--enhance|--no-enhance] [--download]"; shift
+  local model; model=$(cfg defaultModel); local lang; lang=$(cfg language); local threads; threads=$(cfg threads); local from="" to="" dl=0 chunk_s=""
+  # The cleanup pass (#48): config default, overridden per run by the flags.
+  local enhance; enhance=$(cfg enhanceAudio)
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --model) need_val "$@"; model="$2"; shift 2 ;; --language) need_val "$@"; lang="$2"; shift 2 ;;
+      --threads) need_val "$@"; threads="$2"; shift 2 ;;
+      --from) need_val "$@"; from="$2"; shift 2 ;; --to) need_val "$@"; to="$2"; shift 2 ;;
+      --chunk-s) need_val "$@"; chunk_s="$2"; shift 2 ;;
+      --enhance) enhance=true; shift ;; --no-enhance) enhance=false; shift ;;
+      --download) dl=1; shift ;; *) die "unknown option: $1" ;;
+    esac
+  done
+  [[ "$enhance" == "true" ]] || enhance=false   # a hand-edited config must not reach the worker as garbage
+  [[ "$lang" =~ ^(auto|[a-z][a-z])$ ]] || die "language must be auto or a two-letter code (en, de, fr)"
+  [[ -z "$from" ]] || valid_seconds "$from" || die "--from must be a non-negative number of seconds"
+  [[ -z "$to" ]] || valid_seconds "$to" || die "--to must be a non-negative number of seconds"
+  [[ -z "$from" || -z "$to" ]] || awk -v a="$from" -v b="$to" 'BEGIN{exit !(b > a)}' || die "--to must be greater than --from"
+  [[ -z "$chunk_s" || "$chunk_s" =~ ^[1-9][0-9]*$ ]] || die "--chunk-s must be a positive integer of seconds"
+  local dir; dir=$(require_dir "$id")
+  [[ -f "$dir/audio.wav" ]] || die "no audio.wav in $dir"
+  have voxtype || die "voxtype not installed"
+  require_idle "$id"
+  [[ $(jq -r '.duration_s // 0' "$dir/meta.json") == "0" ]] && die "$id has no audio yet"
+  # Fast and Balanced are whisper's .en models: another language (or auto)
+  # gets an English guess. Said once the run is really going ahead: printed
+  # earlier it led every later failure's message, and a chained download's
+  # notification (first stderr line only) showed it instead of the error.
+  local langwarn=""
+  [[ "$model" == *.en && -n "$lang" && "$lang" != "en" ]] \
+    && langwarn="omarecorder: warning: $model only understands English, so language $lang has no effect; Accurate (large-v3-turbo) handles other languages"
+  if ! model_installed "$model"; then
+    if (( dl )); then
+      # All the recording validations above already passed, so the intent is
+      # sound; park it on the download job and let _dl_worker fire it.
+      local then_json; then_json=$(jq -cn --arg id "$id" --arg l "$lang" --arg th "$threads" --arg f "$from" --arg t "$to" --arg c "$chunk_s" --arg e "$enhance" \
+        '{id:$id, language:$l, threads:$th, from:$f, to:$t, chunk_s:$c, enhance:$e}')
+      start_download "$model" "$then_json"
+      log "transcribe $id deferred until $model finishes downloading"
+      if [[ -n "$langwarn" ]]; then echo "$langwarn" >&2; fi
+      echo "will transcribe $id when $model is ready"
+      return 0
+    fi
+    # Suggest the download only when it can actually work: non-catalog names
+    # are allowed when installed, but `model download` would refuse them.
+    if jq -e --arg m "$model" '.[] | select(.name==$m)' <<<"$MODEL_CATALOG" >/dev/null; then
+      echo "omarecorder: model '$model' is not downloaded (run: omarecorder model download $model)" >&2
+    else
+      echo "omarecorder: model '$model' is not installed and not in the catalog (omarecorder models lists what is available)" >&2
+    fi
+    exit 3
+  fi
+  local unit="omarecorder-tx-$id"
+  with_lock _claim_tx "$id" --arg id "$id" --arg m "$model" --arg u "$unit" --argjson t "$(now_epoch)" \
+    '.jobs += [{type:"transcribe", id:$id, model:$m, unit:$u, started_at:$t}]' \
+    || die "transcription already running for $id"
+  log "transcribe $id model=$model lang=$lang range=${from:-0}-${to:-end}${chunk_s:+ chunk_s=$chunk_s} enhance=$enhance"
+  # A per-run chunk override rides the env var run_detached already forwards;
+  # the direct CHUNK_S assignment covers the inline (OMARECORDER_SYNC=1) path,
+  # where the global was evaluated at script load.
+  if [[ -n "$chunk_s" ]]; then export OMARECORDER_CHUNK_S="$chunk_s"; CHUNK_S="$chunk_s"; fi
+  if ! run_detached "$unit" "OmaRecorder transcribe $id" "$SELF" _tx-worker "$id" "$model" "$lang" "$threads" "$from" "$to" "$enhance"; then
+    state_set --arg id "$id" '.jobs |= map(select(.id != $id))'
+    die "could not start transcription job"
+  fi
+  if [[ -n "$langwarn" ]]; then echo "$langwarn" >&2; fi
+  echo "transcribing $id with $model"
+}
+
+# seam_near <wav> <t>: a silence midpoint within ±15 s of t (nearest wins), else t.
+# One 30 s decode per seam; no text heuristics, no overlap between pieces.
+seam_near() {
+  local wav="$1" t="$2" ss
+  ss=$(awk -v t="$t" 'BEGIN{s=t-15; if (s<0) s=0; print s}')
+  ffmpeg -nostats -v info -ss "$ss" -t 30 -i "$wav" -af "silencedetect=n=-35dB:d=0.4" -f null - 2>&1 \
+    | awk -v off="$ss" -v t="$t" '
+        /silence_start:/ { for (i=1;i<=NF;i++) if ($i=="silence_start:") st=$(i+1)+off }
+        /silence_end:/   { for (i=1;i<=NF;i++) if ($i=="silence_end:") { en=$(i+1)+off; m=(st+en)/2; d=m-t; if (d<0) d=-d; if (best=="" || d<bd) { best=m; bd=d } } }
+        END { if (best=="") print t; else printf "%.2f\n", best }'
+}
+# plan_chunks <wav> <dur_s> → lines "start end" (seconds). One piece when the
+# take fits in CHUNK_S; otherwise ceil(dur/CHUNK_S) equal pieces (never a tiny tail).
+plan_chunks() {
+  local wav="$1" dur="$2"
+  if (( dur <= CHUNK_S )); then echo "0 $dur"; return 0; fi
+  local n len i start=0 end
+  n=$(( (dur + CHUNK_S - 1) / CHUNK_S )); len=$(( (dur + n - 1) / n ))
+  for (( i = 1; i <= n; i++ )); do
+    if (( i == n )); then end=$dur
+    else
+      end=$(seam_near "$wav" "$(awk -v s="$start" -v l="$len" 'BEGIN{print s+l}')")
+      # never a non-advancing or overlong piece
+      awk -v s="$start" -v e="$end" -v d="$dur" 'BEGIN{exit !(e > s + 1 && e < d)}' || end=$(awk -v s="$start" -v l="$len" 'BEGIN{print s+l}')
+    fi
+    echo "$start $end"; start=$end
+  done
+}
+# learn_rtf <model> <audio_s> <wall_s>: remember this machine's speed (≥ 60 s of audio only)
+# Transcribe jobs are separate systemd units, so two can finish together; the
+# read-modify-write of bench.json runs under the state lock so neither
+# measurement is lost.
+learn_rtf() {
+  local model="$1" audio="$2" wall="$3"
+  awk -v a="$audio" 'BEGIN{exit !(a >= 60)}' || return 0
+  local rtf; rtf=$(jq -n --argjson d "$audio" --argjson e "$wall" '(($d / $e) * 100 | round) / 100')
+  # A lock timeout loses one measurement; it must never kill the worker.
+  with_lock _learn_rtf "$model" "$rtf" || true
+}
+_learn_rtf() {
+  local model="$1" rtf="$2"
+  mkdir -p "$STATE_DIR"; local bench='{}'; [[ -f "$BENCH_FILE" ]] && bench=$(jq -c . "$BENCH_FILE")
+  write_json "$BENCH_FILE" "$(jq -c --arg m "$model" --argjson r "$rtf" --arg t "$(now_iso)" '.[$m] = {rtf:$r, measured:$t}' <<<"$bench")"
+}
+
+# enhance_audio <in> <out> [errlog]: the cleanup pass (#48). highpass (~80 Hz
+# rumble and hum) -> afftdn (broadband noise) -> loudnorm (two-pass: measure,
+# then apply with the measured values) into <out>, at the whisper rate. The
+# input is only read; the caller falls back to it when any step fails. All
+# three filters ship in stock Omarchy ffmpeg.
+enhance_audio() {
+  local in="$1" out="$2" errlog="${3:-/dev/null}"
+  local chain="highpass=f=80,afftdn"
+  # Pass 1: measure. loudnorm prints its JSON block at the end of stderr.
+  local measured; measured=$(ffmpeg -nostdin -nostats -v info -i "$in" \
+    -af "$chain,loudnorm=I=-16:TP=-1.5:LRA=11:print_format=json" -f null - 2>&1 | sed -n '/^{/,/^}/p') || true
+  local mi mtp mlra mth moff v
+  mi=$(jq -r '.input_i // empty' <<<"$measured" 2>/dev/null)
+  mtp=$(jq -r '.input_tp // empty' <<<"$measured" 2>/dev/null)
+  mlra=$(jq -r '.input_lra // empty' <<<"$measured" 2>/dev/null)
+  mth=$(jq -r '.input_thresh // empty' <<<"$measured" 2>/dev/null)
+  moff=$(jq -r '.target_offset // empty' <<<"$measured" 2>/dev/null)
+  # Plain numbers only before they go into a filter string (silence measures
+  # as -inf, and a failed pass 1 leaves them empty).
+  for v in "$mi" "$mtp" "$mlra" "$mth" "$moff"; do
+    [[ "$v" =~ ^-?[0-9]+([.][0-9]+)?$ ]] || { log "enhance: measurement pass gave no usable values for $in"; return 1; }
+  done
+  # Pass 2: apply. The chain is identical, so the measurements still hold.
+  ffmpeg -nostdin -v error -y -i "$in" \
+    -af "$chain,loudnorm=I=-16:TP=-1.5:LRA=11:measured_I=$mi:measured_TP=$mtp:measured_LRA=$mlra:measured_thresh=$mth:offset=$moff:linear=true" \
+    -ar "$RATE" -ac 1 -c:a pcm_s16le "$out.tmp.$$.wav" 2>>"$errlog" || { rm -f "$out.tmp.$$.wav"; return 1; }
+  mv -f "$out.tmp.$$.wav" "$out"
+}
+
+_tx_worker() {
+  local id="$1" model="$2" lang="$3" threads="$4" from="$5" to="$6" enhance="${7:-false}"
+  local dir; dir=$(require_dir "$id")
+  local ttl; ttl=$(jq -r '.title // empty' "$dir/meta.json"); ttl="${ttl:-$id}"
+  local acc="$dir/transcript.md.tmp" errlog="$RUN_DIR/tx-$id.err" child="" start done_audio=0
+  mkdir -p "$RUN_DIR"
+  # `omarecorder cancel` stops the unit with SIGTERM. Stop our own child (never
+  # the process group: inline runs share it with the caller), keep what was
+  # already published (transcript.md + meta already say partial=true), learn the
+  # speed from the pieces that finished, and exit 0 so systemd sees no failure.
+  trap '[[ -n "$child" ]] && kill -TERM "$child" 2>/dev/null
+        [[ -n "$start" ]] && learn_rtf "$model" "$done_audio" "$(awk -v s="$start" -v e="$(date +%s.%N)" "BEGIN{d=e-s; if(d<0.1)d=0.1; printf \"%.1f\", d}")"
+        rm -f "$acc" "$RUN_DIR/tx-$id".* "$dir"/audio.tx.*; exit 0' TERM INT HUP
+  local input="$dir/audio.wav" tmpwav="" dur
+  # The big WAV temps (range cut, chunks) live next to the recording, not in
+  # $RUN_DIR: that is tmpfs, and a long take would push hundreds of MB into RAM.
+  rm -f "$dir"/audio.tx.*
+  dur=$(jq -r '.duration_s // 0' "$dir/meta.json")
+  if [[ -n "$from" || -n "$to" ]]; then
+    tmpwav="$dir/audio.tx.cut.wav"
+    local -a cut=(); [[ -n "$from" ]] && cut+=(-ss "$from"); [[ -n "$to" ]] && cut+=(-to "$to")
+    if ! ffmpeg -v error -y "${cut[@]}" -i "$dir/audio.wav" -c copy "$tmpwav" 2>"$errlog"; then
+      state_set --arg id "$id" '.jobs |= map(select(.id != $id))' || true
+      notify "Transcription failed · $ttl" "could not cut the requested range"; log "transcribe FAILED $id (range cut)"; return 0
+    fi
+    input="$tmpwav"; dur=$(audio_duration "$tmpwav"); dur=${dur:-0}
+  fi
+  # The cleanup pass runs on the whole tx input, before any chunking, and only
+  # on a temporary copy: audio.wav is never modified, and playback always plays
+  # what was recorded. A failed pass falls back to the original audio; the
+  # transcription itself must never die on a cosmetic step.
+  local enhanced=false enh_skipped=false
+  if [[ "$enhance" == "true" ]]; then
+    local enhwav="$dir/audio.tx.enh.wav"
+    if enhance_audio "$input" "$enhwav" "$errlog"; then
+      input="$enhwav"; enhanced=true
+      local edur; edur=$(audio_duration "$enhwav"); [[ -n "$edur" ]] && dur="$edur"
+    else
+      enh_skipped=true
+      log "enhance failed for $id; transcribing the original audio"
+    fi
+  fi
+  local -a opts=(--model "$model" --language "$lang")
+  [[ "$threads" =~ ^[1-9][0-9]*$ ]] && opts+=(--threads "$threads")
+  local -a plan; mapfile -t plan < <(plan_chunks "$input" "$dur")
+  local n=${#plan[@]} i=0 piece s e cwav="$input" ctxt="$RUN_DIR/tx-$id.chunk.txt" rc=0 prev_kept=0 why=""
+  # mapfile hides a failed planner (process substitution): an empty plan must
+  # take the failure path, never publish an empty transcript over a good one.
+  if (( n == 0 )); then rc=1; why="could not plan the pieces (duration ${dur}s, OMARECORDER_CHUNK_S=$CHUNK_S)"; fi
+  : > "$acc"
+  start=$(date +%s.%N)
+  for piece in "${plan[@]}"; do
+    i=$((i + 1)); s=${piece% *}; e=${piece#* }
+    state_set --arg id "$id" --argjson n "$i" --argjson N "$n" \
+      '.jobs |= map(if .type=="transcribe" and .id==$id then .progress={chunk:$n, chunks:$N} else . end)' || true
+    if (( n > 1 )); then
+      cwav="$dir/audio.tx.chunk.wav"
+      ffmpeg -v error -y -ss "$s" -to "$e" -i "$input" -c copy "$cwav" || { rc=1; break; }
+    fi
+    # whisper's stderr goes to a per-job file (it can echo decoded text), not the shared log.
+    voxtype -q "${opts[@]}" transcribe "$cwav" 2>"$errlog" | awk 'seen{print} /^$/{seen=1}' > "$ctxt" &
+    child=$!; wait "$child" || rc=1; child=""
+    (( rc == 0 )) || break
+    if grep -q '[^[:space:]]' "$ctxt"; then cat "$ctxt" >> "$acc"; printf '\n' >> "$acc"; fi
+    done_audio=$(awk -v a="$done_audio" -v s="$s" -v e="$e" 'BEGIN{print a + (e - s)}')
+    if (( prev_kept == 0 )); then [[ -f "$dir/transcript.md" ]] && cp -f "$dir/transcript.md" "$dir/transcript.prev.md"; prev_kept=1; fi
+    if (( i < n )); then   # publish what we have so far; the Library shows it growing
+      publish_transcript "$dir" "$acc" "$model" "$lang" "$from" "$to" "$n" true "$enhanced"
+      tidy_transcript "$dir"
+      update_meta "$dir" '.transcript = ((.transcript // {}) + {model:$m, language:$l, created:$c, partial:true, chunks:$N, chunks_done:$i, chunk_s:$k, enhanced:$E})' \
+        --arg m "$model" --arg l "$lang" --arg c "$(now_iso)" --argjson N "$n" --argjson i "$i" --argjson k "$CHUNK_S" --argjson E "$enhanced"
+    fi
+  done
+  rm -f "$dir"/audio.tx.* "$ctxt"
+  if (( rc != 0 )); then
+    state_set --arg id "$id" '.jobs |= map(select(.id != $id))' || true
+    [[ -n "$why" ]] || why=$(grep -iE 'error|failed|cannot|not found' "$errlog" 2>/dev/null | tail -1 | cut -c1-120)
+    mkdir -p "$STATE_DIR"; mv -f "$errlog" "$STATE_DIR/tx-$id.err" 2>/dev/null || true
+    if (( i > 1 )) && [[ -s "$acc" ]]; then   # some pieces made it: keep them, say so
+      publish_transcript "$dir" "$acc" "$model" "$lang" "$from" "$to" "$n" true "$enhanced"
+      tidy_transcript "$dir"
+      notify "Transcription stopped after $((i - 1))/$n pieces · $ttl" "${why:-voxtype failed}. The finished pieces are kept (details: $STATE_DIR/tx-$id.err)"
+    else
+      notify "Transcription failed · $ttl" "${why:-voxtype returned no text} (details: $STATE_DIR/tx-$id.err)"
+    fi
+    rm -f "$acc"; log "transcribe FAILED $id after piece $i/$n"; return 0
+  fi
+  rm -f "$errlog"
+  local elapsed; elapsed=$(awk -v s="$start" -v e="$(date +%s.%N)" 'BEGIN{d=e-s; if(d<0.1)d=0.1; printf "%.1f", d}')
+  grep -q '[^[:space:]]' "$acc" || printf '(no speech detected)\n' > "$acc"
+  publish_transcript "$dir" "$acc" "$model" "$lang" "$from" "$to" "$n" false "$enhanced"
+  rm -f "$acc"
+  learn_rtf "$model" "$done_audio" "$elapsed"
+  local rtf; rtf=$(jq -n --argjson d "$done_audio" --argjson e "$elapsed" '(($d / $e) * 100 | round) / 100')
+  update_meta "$dir" '.transcript = {model:$m, language:$l, created:$c, elapsed_s:$e, rtf:$r, chunks:$N, chunks_done:$N, partial:false, chunk_s:$k, enhanced:$E}' \
+    --arg m "$model" --arg l "$lang" --arg c "$(now_iso)" --argjson e "$elapsed" --argjson r "$rtf" --argjson N "$n" --argjson k "$CHUNK_S" --argjson E "$enhanced"
+  # After the final meta write: update_meta above replaces .transcript whole, and
+  # tidy merges its stats into it, so tidy must come last.
+  tidy_transcript "$dir"
+  state_set --arg id "$id" '.jobs |= map(select(.id != $id))' || true
+  log "transcribe ok $id model=$model pieces=$n elapsed=${elapsed}s rtf=$rtf"
+  local ready_note; ready_note="$(model_label "$model") took $(fmt_hms "${elapsed%.*}")."
+  [[ "$enh_skipped" == true ]] && ready_note+=" Audio cleanup failed, so the original audio was transcribed."
+  notify "Transcript ready · $ttl" "$ready_note Click to open" -- "$SELF" open "$id"
+}
+# publish_transcript <dir> <body> <model> <lang> <from> <to> <chunks> <partial> [enhanced]: header + body → transcript.md (atomic)
+publish_transcript() {
+  local dir="$1" body="$2" model="$3" lang="$4" from="$5" to="$6" chunks="$7" partial="$8" enhanced="${9:-false}" ptag=""
+  [[ "$partial" == "true" ]] && ptag=" partial=true"
+  [[ "$enhanced" == "true" ]] && ptag="$ptag enhanced=true"
+  { printf '<!-- omarecorder model=%s language=%s created=%s range=%s-%s chunks=%s%s -->\n' "$model" "$lang" "$(now_iso)" "${from:-0}" "${to:-end}" "$chunks" "$ptag"
+    cat "$body"; } > "$dir/transcript.md.new"
+  mv -f "$dir/transcript.md.new" "$dir/transcript.md"
+}
+
+cmd_cancel() {
+  local id="${1:-}"; [[ -n "$id" ]] || die "usage: cancel <id>"
+  id_valid "$id" || die "invalid recording id: $id"
+  local was=0; unit_active "omarecorder-tx-$id" && was=1
+  systemctl --user stop "omarecorder-tx-$id" 2>/dev/null || true
+  systemctl --user reset-failed "omarecorder-tx-$id" 2>/dev/null || true
+  # Only transcriptions are cancelled here; an edit claim is not ours to drop.
+  local had_job=0; [[ $(jq -r --arg id "$id" '[.jobs[] | select(.type=="transcribe" and .id==$id)] | length' <<<"$(read_state)") != 0 ]] && had_job=1
+  state_set --arg id "$id" '.jobs |= map(select(.type != "transcribe" or .id != $id))'
+  local dir; dir=$(rec_dir "$id" 2>/dev/null || true); [[ -n "$dir" ]] && rm -f "$dir/transcript.md.tmp" "$dir/transcript.md.new" "$dir"/audio.tx.*
+  rm -f "$RUN_DIR/tx-$id".*
+  if (( was )); then
+    local ttl; ttl=$(jq -r '.title // empty' "$dir/meta.json" 2>/dev/null); ttl="${ttl:-$id}"
+    if [[ -n "$dir" && $(jq -r '.transcript.partial // false' "$dir/meta.json" 2>/dev/null) == "true" ]]; then
+      notify "Transcription cancelled · $ttl" "Kept $(jq -r '"\(.transcript.chunks_done)/\(.transcript.chunks)"' "$dir/meta.json") pieces. Re-transcribe any time to finish"
+    else
+      notify "Transcription cancelled · $ttl" "The recording is untouched. Transcribe it again any time"
+    fi
+    log "transcribe cancelled $id"
+  fi
+  # A script was told "cancelled" for an id that had nothing running.
+  if (( was || had_job )); then echo "cancelled $id"; else echo "nothing to cancel for $id"; fi
+}
+
+# -------------------------------------------------------- play / open ------
+cmd_play() {
+  local id="${1:-}" from=""; [[ -n "$id" ]] || die "usage: play <id> [--from s]"
+  if [[ -n "${2:-}" ]]; then
+    [[ "$2" == "--from" ]] || die "unknown option: $2"
+    from="${3:-}"; valid_seconds "$from" || die "--from must be a non-negative number of seconds"
+  fi
+  local dir; dir=$(require_dir "$id")
+  cmd_stop_play >/dev/null 2>&1 || true
+  mkdir -p "$RUN_DIR"
+  local -a player
+  if have mpv; then
+    # The IPC socket lets the Library scrub and pause; playback stays outside the
+    # shell process (an in-shell QtMultimedia player crashed quickshell on 2 h takes).
+    # --ao=pulse: the pulse layer of PipeWire, deliberately. mpv's native pipewire
+    # output takes a realtime thread via rtkit, and a machine under RT-budget
+    # pressure then has the kernel SIGKILL the player (RLIMIT_RTTIME) with no
+    # trace. The pulse path is immune and costs nothing.
+    player=(mpv --no-video --really-quiet --ao=pulse --input-ipc-server="$RUN_DIR/mpv.sock" --keep-open=no)
+    [[ -n "$from" ]] && player+=("--start=$from")
+    player+=("$dir/audio.wav")
+  else player=(pw-play "$dir/audio.wav"); fi
+  setsid "${player[@]}" >/dev/null 2>&1 < /dev/null &
+  echo $! > "$PLAY_PID_FILE"; echo "playing $id"
+}
+# Only ever signal a pid that is still our player (pids get recycled).
+cmd_stop_play() {
+  [[ -f "$PLAY_PID_FILE" ]] || { echo "not playing"; return 0; }
+  local p; p=$(cat "$PLAY_PID_FILE"); rm -f "$PLAY_PID_FILE"
+  if [[ "$p" =~ ^[0-9]+$ ]] && [[ "$(cat "/proc/$p/comm" 2>/dev/null)" =~ ^(mpv|pw-play)$ ]]; then kill "$p" 2>/dev/null || true; fi
+  # mpv leaves its IPC socket behind when it is signalled rather than told to quit.
+  rm -f "$RUN_DIR/mpv.sock"
+  echo "stopped"
+}
+cmd_open() {
+  local id="${1:-}" raw=""; [[ -n "$id" ]] || die "usage: open <id> [--raw]"; shift
+  while [[ $# -gt 0 ]]; do case "$1" in --raw) raw=raw ;; *) die "unknown option: $1" ;; esac; shift; done
+  local dir; dir=$(require_dir "$id")
+  [[ -f "$dir/transcript.md" ]] || die "no transcript yet for $id"
+  # The tidy transcript when there is one, as the Library shows it; --raw for whisper's own.
+  local f; f=$(transcript_file "$dir" "$raw")
+  # The editor gets the file through a private link named by the id, so the
+  # folder's title (whatever a user typed) never reaches a terminal's command
+  # line: omarchy-launch-editor runs it through xdg-terminal-exec -e.
+  local link="$RUN_DIR/open/$id"
+  mkdir -p "$RUN_DIR/open" && ln -sfn -- "$dir" "$link" && f="$link/${f##*/}"
+  if have omarchy-launch-editor; then omarchy-launch-editor "$f"
+  elif have xdg-open; then xdg-open "$f"
+  else die "no editor to open it with (install xdg-utils); the transcript is $f"; fi
+}
+cmd_folder() {
+  local id="${1:-}"; [[ -n "$id" ]] || die "usage: folder <id>"
+  local dir; dir=$(require_dir "$id")
+  have xdg-open || die "xdg-open not found (package: xdg-utils); the folder is $dir"
+  setsid xdg-open "$dir" >/dev/null 2>&1 < /dev/null &
+  echo "$dir"
+}
+cmd_library() { have omarchy-shell || die "omarchy-shell not found"; omarchy-shell shell toggle "$PLUGIN_ID"; }
+
+# --------------------------------------------------------------- setup -----
+cmd_setup() {
+  [[ "${1:-}" == "check" ]] || die "usage: setup check [--json]"
+  local as_json=0; want_json "${@:2}" && as_json=1
+  local voxtype_ok=false backend="" mic="" root_ok=false installed='[]' m
+  if have voxtype; then
+    voxtype_ok=true
+    backend=$(voxtype setup gpu --status 2>/dev/null | sed -n 's/^Active backend: //p' | head -1 || true)
+  fi
+  # Every external tool we call, with the package that provides it. "required"
+  # tools block recording/transcribing; the rest only disable one feature.
+  local tools='[
+    {"tool":"voxtype","package":"omarchy install dictation","required":true,"for":"transcription"},
+    {"tool":"pw-record","package":"pipewire","required":true,"for":"recording"},
+    {"tool":"pactl","package":"libpulse","required":true,"for":"finding the microphone"},
+    {"tool":"ffmpeg","package":"ffmpeg","required":true,"for":"import, mixing, levels"},
+    {"tool":"ffprobe","package":"ffmpeg","required":true,"for":"durations"},
+    {"tool":"jq","package":"jq","required":true,"for":"state"},
+    {"tool":"flock","package":"util-linux","required":true,"for":"state locking"},
+    {"tool":"setsid","package":"util-linux","required":true,"for":"detaching players and editors"},
+    {"tool":"systemd-run","package":"systemd","required":false,"for":"background transcription"},
+    {"tool":"systemctl","package":"systemd","required":false,"for":"tracking background jobs"},
+    {"tool":"systemd-inhibit","package":"systemd","required":false,"for":"keeping the machine awake"},
+    {"tool":"wl-copy","package":"wl-clipboard","required":false,"for":"copy transcript"},
+    {"tool":"gio","package":"glib2","required":false,"for":"move to trash"},
+    {"tool":"xdg-open","package":"xdg-utils","required":false,"for":"open folder / Obsidian"},
+    {"tool":"mpv","package":"mpv","required":false,"for":"playback"},
+    {"tool":"pw-play","package":"pipewire","required":false,"for":"playback without mpv"},
+    {"tool":"omarchy-notification-send","package":"omarchy","required":false,"for":"desktop notifications"},
+    {"tool":"notify-send","package":"libnotify","required":false,"for":"desktop notifications (fallback)"},
+    {"tool":"omarchy-launch-editor","package":"omarchy","required":false,"for":"opening a transcript"},
+    {"tool":"omarchy-shell","package":"omarchy","required":false,"for":"toggling the Library"},
+    {"tool":"obsidian","package":"obsidian","required":false,"for":"opening an exported note"}]'
+  local checked='[]' missing='[]' t present required_ok=true
+  while IFS= read -r t; do
+    present=false; have "$(jq -r .tool <<<"$t")" && present=true
+    checked=$(jq -c --argjson t "$t" --argjson p "$present" '. + [$t + {present:$p}]' <<<"$checked")
+    if [[ $present == false ]]; then
+      missing=$(jq -c --argjson t "$t" '. + [$t]' <<<"$missing")
+      [[ $(jq -r .required <<<"$t") == "true" ]] && required_ok=false
+    fi
+  done < <(jq -c '.[]' <<<"$tools")
+  mic=$(resolve_mic || true)
+  mkdir -p "$ROOT" 2>/dev/null && [[ -w "$ROOT" ]] && root_ok=true
+  installed=$(cmd_models --json | jq -c '[.[] | select(.installed) | .name]')
+  local default_ok=false; model_installed "$(cfg defaultModel)" && default_ok=true
+  # A microphone is required only when the source records one (mic or both):
+  # a machine without one records system audio fine, and used to stay stuck
+  # on "Setup needed" forever.
+  local mic_required=true; [[ $(cfg defaultSource) == "system" ]] && mic_required=false
+  local ok=false; [[ $required_ok == true && ( -n "$mic" || $mic_required == false ) && $root_ok == true && $default_ok == true ]] && ok=true
+  local out; out=$(jq -cn --argjson ok "$ok" --argjson v "$voxtype_ok" --arg b "$backend" --argjson tools "$checked" --argjson missing "$missing" \
+    --arg mic "$mic" --argjson mr "$mic_required" --arg root "$ROOT" --argjson r "$root_ok" --argjson inst "$installed" --arg dm "$(cfg defaultModel)" --argjson dmok "$default_ok" --arg ver "$VERSION" \
+    '{ok:$ok, version:$ver, voxtype:$v, backend:$b, tools:$tools, missing:$missing,
+      ffmpeg:($tools | any(.tool=="ffmpeg" and .present)), pw_record:($tools | any(.tool=="pw-record" and .present)),
+      mic:$mic, mic_ok:($mic != ""), mic_required:$mr, recordingsDir:$root, recordingsDir_ok:$r,
+      installed_models:$inst, defaultModel:$dm, defaultModel_ok:$dmok}')
+  if (( as_json )); then jq . <<<"$out"; else
+    # Scalars as a key/value block, then the tool table: `to_entries` alone
+    # printed both arrays as one unreadable line of compact JSON.
+    jq -r 'to_entries[] | select(.value | type != "array") | "\(.key): \(.value)"' <<<"$out"
+    echo; echo "tools:"
+    jq -r 'def pad($w): . + (" " * ([$w - length, 1] | max));
+      .tools[] | "  \(if .present then "✓" else " " end) \(.tool | pad(26)) \(if .required then "required" else "optional" end)  \(.for | pad(32)) \(.package)"' <<<"$out"
+    if [[ $(jq -r '.missing | length' <<<"$out") -gt 0 ]]; then
+      echo; echo "missing:"; jq -r '.missing[] | "  \(.tool) → \(.package)"' <<<"$out"
+    fi
+  fi
+  [[ $ok == true ]]
+}
+
+# ---------------------------------------------------------------- main -----
+usage() {
+  cat <<EOF
+omarecorder $VERSION: record, keep, transcribe locally (voxtype)
+
+  record start [--source mic|system|both] [--title T]    start a recording
+  record resume                                          continue the last stopped recording
+  record stop [--guard] | toggle | status [--json]       control / inspect
+  import <file> [--move] [--title T]                     bring an existing audio file in
+  list [--json] | show <id> [--json] | analyze <id>      browse / measure levels
+  search <text>                                          ids whose title, note or transcript contains the text
+  rename <id> <title>                                    retitle (empty title clears it)
+  delete <id> [--yes] [--permanent]                      remove (trash unless --permanent)
+  note <id> <text>                                       set a note on a recording (empty text clears it)
+  trim <id> --from s --to s [--replace] | trim <id> --restore  cut the audio (first original kept as audio.orig.wav)
+  copy <id> [--raw] [--print]                            transcript text to the clipboard
+  tidy <id>                                              rebuild transcript.tidy.md (paragraphs, loops removed)
+  dictionary [--json] | dictionary add <heard> <written> corrections tidy applies (whisper mishearings)
+  dictionary edit | prompt [--copy] | export [path] | import <file|--clipboard>
+  export <id> [--vault P | --dir P] [--no-open] [--raw]  transcript → Obsidian note (frontmatter + text)
+  vaults [--json]                                        Obsidian vaults on this machine (* = open)
+  transcribe <id> [--model M] [--language L] [--threads N] [--from s --to s]
+              [--chunk-s N] [--enhance|--no-enhance] [--download]
+  cancel <id> | estimate <id> [--model M]
+  models [--json] | model download <name> | model cancel <name>
+  play <id> [--from s] | stop-play | open <id> [--raw] | folder <id>
+  config get [key|--json] | config set <key> <value>
+  setup check [--json] | library | status [--json] | version
+
+Files: $ROOT (recordings), $CONFIG_FILE, $STATE_FILE
+EOF
+}
+
+main() {
+  load_config
+  mkdir -p "$RUN_DIR" 2>/dev/null || true
+  # Pids and the player socket live here, so it has to be a real directory this
+  # user owns, checked before anything follows it: never a symlink or someone
+  # else's folder (OMARECORDER_RUN_DIR, a test hook, can point anywhere).
+  if [[ -d "$RUN_DIR" && ! -L "$RUN_DIR" && -O "$RUN_DIR" ]]; then chmod 700 "$RUN_DIR" 2>/dev/null || true   # private even if it pre-dates umask 077
+  else case "${1:-help}" in help|-h|--help|version) ;; *) die "runtime directory $RUN_DIR is not a private directory owned by you" ;; esac; fi
+  mkdir -p "$STATE_DIR" 2>/dev/null || true   # ffmpeg stderr is appended to $LOG_FILE before anything has logged
+  local cmd="${1:-help}"; shift || true
+  case "$cmd" in
+    record) cmd_record "$@" ;;
+    status) cmd_status "$@" ;;
+    import) cmd_import "$@" ;;
+    list) cmd_list "$@" ;;
+    search) cmd_search "$@" ;;
+    show) cmd_show "$@" ;;
+    analyze) cmd_analyze "$@" ;;
+    trim) cmd_trim "$@" ;;
+    rename) cmd_rename "$@" ;;
+    note) cmd_note "$@" ;;
+    delete) cmd_delete "$@" ;;
+    copy) cmd_copy "$@" ;;
+    tidy) cmd_tidy "$@" ;;
+    dictionary) cmd_dictionary "$@" ;;
+    export) cmd_export "$@" ;;
+    vaults) cmd_vaults "$@" ;;
+    transcribe) cmd_transcribe "$@" ;;
+    cancel) cmd_cancel "$@" ;;
+    estimate) cmd_estimate "$@" ;;
+    models) cmd_models "$@" ;;
+    model) cmd_model "$@" ;;
+    play) cmd_play "$@" ;;
+    stop-play) cmd_stop_play ;;
+    open) cmd_open "$@" ;;
+    folder) cmd_folder "$@" ;;
+    library) cmd_library ;;
+    config) cmd_config "$@" ;;
+    setup) cmd_setup "$@" ;;
+    version|--version|-V) echo "$VERSION" ;;
+    help|--help|-h) usage ;;
+    _tx-worker) _tx_worker "$@" ;;
+    _dl-worker) _dl_worker "$@" ;;
+    _meter) _meter "$@" ;;
+    _meter-loop) _meter_loop "$@" ;;
+    *) usage >&2; exit 2 ;;
+  esac
+}
+main "$@"

@@ -1,0 +1,481 @@
+pragma ComponentBehavior: Bound
+import QtQuick
+import QtQuick.Controls
+import Quickshell.Io
+import qs.Commons
+import qs.Ui
+import "ui"
+import "ui/state.js" as State
+
+// OmaRecorder bar widget: glyph + elapsed timer in the bar, and a popup with
+// record/stop, source, the most recent recordings, and settings.
+// All state comes from Service.qml (shared across monitors); this file is a view.
+Panel {
+  id: root
+  moduleName: "io.github.huey-holdings-llc.omarecorder"
+  ipcTarget: "io.github.huey-holdings-llc.omarecorder"
+  manageIpc: false
+
+  readonly property var svc: bar && bar.shell && bar.shell.serviceFor ? bar.shell.serviceFor(moduleName) : null
+  readonly property bool ready: svc !== null
+  readonly property bool recording: ready && svc.recording
+  readonly property bool transcribing: ready && svc.transcribing
+
+  readonly property color foreground: bar ? bar.foreground : Color.foreground
+  readonly property color urgent: bar ? bar.urgent : Color.urgent
+  readonly property color dim: Qt.darker(foreground, 1.55)
+  readonly property string fontFamily: bar ? bar.fontFamily : Style.font.family
+  readonly property bool vertical: bar ? bar.vertical : false
+  // 0 is a real setting (the list off); `|| 5` read it as unset.
+  readonly property int recentCount: { var n = parseInt(setting("recentCount", 5)); return isNaN(n) ? 5 : Math.max(0, Math.min(10, n)) }
+
+  // Idle shows a microphone (what the button does), recording the red record
+  // glyph plus the timer, transcribing an hourglass.
+  readonly property string barGlyph: recording ? "󰑊" : (transcribing ? "󰔟" : (ready && svc.downloading ? "󰇚" : "󰕽"))
+  // While the input clips the bar says so instead of the timer (the glyph is already urgent-coloured).
+  readonly property string barLabel: recording && !vertical ? "  " + (svc.clipping ? "CLIP" : svc.elapsedText) : ""
+  readonly property string stateText: !ready ? "Service unavailable"
+    // Short: the hero shows this uppercased on one line, about 44 characters.
+    : recording && svc.stopArmed ? "Stop again within 10 s to end it"
+    : recording ? "Recording " + svc.elapsedText + (svc.activeRecording ? " · " + svc.sourceLabel(svc.activeRecording.source) : "") + (svc.clipping ? " · ⚠ clipping" : "")
+    : transcribing ? "Transcribing " + svc.jobProgressText(svc.activeJob) + svc.transcribeElapsedText + " · " + svc.activeJobTitle
+    : (svc.downloading ? "Downloading model…" : "Ready")
+
+  property bool settingsOpen: false
+  property bool cursorActive: false
+  property int cursorIndex: -1
+  // The take being recorded is the hero's status line already; Recent lists the rest.
+  readonly property var recent: ready ? svc.recordings.filter(function(r) { return r.id !== svc.activeId }).slice(0, recentCount) : []
+
+  implicitWidth: button.implicitWidth
+  implicitHeight: button.implicitHeight
+
+  onOpenedChanged: if (opened) {
+    cursorActive = false; cursorIndex = -1; settingsSection.resetCursor()
+    if (panelFlick) panelFlick.contentY = 0
+    if (ready) svc.refresh()
+    Qt.callLater(function() { keyCatcher.forceActiveFocus() })
+  }
+  // Settings live at the bottom of a capped popup: Recent folds away while
+  // they are open. One deferred scroll is not enough, because the popup
+  // itself grows over the next frames as the section lays out, so the view
+  // follows the bottom until the user takes over or settings close.
+  property bool settingsFollowBottom: false
+  onSettingsOpenChanged: {
+    cursorActive = false; cursorIndex = -1; settingsSection.resetCursor()
+    settingsFollowBottom = settingsOpen
+    Qt.callLater(function() {
+      if (!panelFlick) return
+      panelFlick.contentY = settingsOpen ? Math.max(0, panelFlick.contentHeight - panelFlick.height) : 0
+    })
+  }
+
+  // With settings open the cursor walks the settings instead of Recent
+  // (which folds away), so the keyboard reaches every control the mouse can.
+  function moveCursor(dy) {
+    if (settingsOpen) { settingsSection.moveCursor(dy); return }
+    if (recent.length === 0) return
+    cursorActive = true
+    cursorIndex = Math.max(0, Math.min(recent.length - 1, cursorIndex + dy))
+  }
+  function activateCursor() {
+    if (settingsOpen) { settingsSection.activateCursor(); return }
+    if (!cursorActive || cursorIndex < 0 || cursorIndex >= recent.length) return
+    var r = recent[cursorIndex]
+    if (r.id === svc.activeId) return
+    if (r.has_transcript) svc.openTranscript(r.id); else svc.transcribe(r.id)
+  }
+  // Keeps the settings control under the cursor inside the scrolled popup.
+  function ensureVisible(item) {
+    if (!panelFlick || !item) return
+    var y = item.mapToItem(column, 0, 0).y
+    if (y < panelFlick.contentY) panelFlick.contentY = y
+    else if (y + item.height > panelFlick.contentY + panelFlick.height) panelFlick.contentY = y + item.height - panelFlick.height
+  }
+  function toggleRecording() { if (ready) svc.toggleRecording() }
+  // Import = a path field in the popup. (A QtQuick FileDialog crashes
+  // Quickshell on Omarchy 4 (both in-shell and in its own process) so no
+  // graphical picker until that is fixed upstream.)
+  property bool importOpen: false
+  function importAudio() {
+    if (!ready) return
+    importOpen = !importOpen
+    if (importOpen) Qt.callLater(function() {
+      importField.forceActiveFocus()
+      if (panelFlick) panelFlick.contentY = Math.max(0, panelFlick.contentHeight - panelFlick.height)
+    })
+  }
+  function openLibrary(id) { if (ready) { root.close(); svc.openLibrary(id) } }
+  // One list for the Source dropdown and its key (`c` forward, `C` back).
+  readonly property var sources: [
+    { value: "mic", label: "Microphone (what the mic hears)" },
+    { value: "system", label: "System audio (what the computer plays)" },
+    { value: "both", label: "Mic + system audio (two tracks, mixed)" }
+  ]
+  function cycleSource(dir) {
+    if (!ready || recording) return
+    svc.setConfig("defaultSource", State.cycleValue(sources.map(function(o) { return o.value }), svc.defaultSource, dir))
+  }
+
+  IpcHandler {
+    target: root.ipcTarget
+    function open(): void { root.open() }
+    function close(): void { root.close() }
+    function show(): void { root.open() }
+    function hide(): void { root.close() }
+    function toggle(): void { root.toggle() }
+    function record(): string { root.toggleRecording(); return root.recording ? "stopping" : "starting" }
+    function status(): string { return root.stateText }
+    function library(): void { root.openLibrary() }
+    function importAudio(): void { root.importAudio() }
+  }
+
+  // WidgetButton (not BarIconButton) so the bar slot grows with the timer
+  // label instead of overflowing into neighbouring widgets.
+  WidgetButton {
+    id: button
+    anchors.fill: parent
+    bar: root.bar
+    // Glyph-only while idle; give assistive tech the state instead.
+    Accessible.role: Accessible.Button
+    Accessible.name: root.stateText
+    text: root.barGlyph + root.barLabel
+    active: root.recording
+    fontSize: root.recording ? Style.font.bodySmall : Style.bar.iconFont
+    tooltipText: root.stateText + (root.recording ? "\nRight-click to stop" : "\nRight-click to record")
+    onPressed: function(buttonCode) {
+      if (buttonCode === Qt.RightButton) root.toggleRecording()
+      else root.toggle()
+    }
+  }
+
+  KeyboardPanel {
+    id: panel
+    anchorItem: button
+    owner: root
+    bar: root.bar
+    open: root.opened
+    focusTarget: keyCatcher
+    contentWidth: panel.fittedContentWidth(Style.space(380))
+    contentHeight: panel.fittedContentHeight(column.implicitHeight + keyLegend.implicitHeight + Style.spacing.xs, Style.space(600))
+
+    PanelKeyCatcher {
+      id: keyCatcher
+      anchors.fill: parent
+      blocked: (settingsSection.visible && settingsSection.editing) || importField.activeFocus
+      // The catcher eats h/j/k/l as vim movement, so "l" arrives as dx=1: route
+      // it to the library (nothing else uses horizontal movement here).
+      onMoveRequested: function(dx, dy) { if (dx === 1) root.openLibrary(); else root.moveCursor(dy) }
+      onActivateRequested: root.activateCursor()
+      onCloseRequested: root.close()
+      onTabRequested: function(direction) { root.switchPanel(direction) }
+      // The kit sends `x` as "delete"; here it dismisses an error message.
+      onDeleteRequested: if (root.ready && root.svc.lastError.length > 0) root.svc.clearError()
+      onTextKey: function(t) {
+        if (t === "r" || t === "R") root.toggleRecording()
+        else if (t === "l" || t === "L") root.openLibrary()
+        else if (t === "s" || t === "S") root.settingsOpen = !root.settingsOpen
+        else if (t === "i" || t === "I") root.importAudio()
+        else if (t === "c" || t === "C") root.cycleSource(t === "C" ? -1 : 1)
+        else if ((t === "u" || t === "U") && root.ready && root.svc.resumable && !root.recording) root.svc.resumeRecording()
+        else if ((t === "d" || t === "D") && root.ready) { root.settingsOpen = true; root.settingsFollowBottom = true; Qt.callLater(settingsSection.focusDictAdd) }
+      }
+
+      Flickable {
+        id: panelFlick
+        anchors.top: parent.top
+        anchors.left: parent.left
+        anchors.right: parent.right
+        anchors.bottom: keyLegend.top
+        anchors.bottomMargin: Style.spacing.xs
+        contentWidth: width
+        contentHeight: column.implicitHeight
+        clip: true
+        boundsBehavior: Flickable.StopAtBounds
+        flickableDirection: Flickable.VerticalFlick
+        interactive: contentHeight > height
+        onContentHeightChanged: if (root.settingsFollowBottom) contentY = Math.max(0, contentHeight - height)
+        onHeightChanged: if (root.settingsFollowBottom) contentY = Math.max(0, contentHeight - height)
+        onMovementStarted: root.settingsFollowBottom = false
+        ScrollBar.vertical: ThinScrollBar { id: panelBar; foreground: root.foreground }
+
+        Column {
+          id: column
+          width: panelFlick.width - (panelFlick.contentHeight > panelFlick.height ? panelBar.width + Style.spacing.xs : 0)
+          spacing: Style.spacing.md
+
+          PanelHero {
+            id: hero
+            // Inside iconComponent/trailingControl `root` resolves to the hero,
+            // so panel state is exposed here under distinct names.
+            readonly property bool rec: root.recording
+            readonly property bool busy: root.transcribing
+            readonly property color recColor: root.urgent
+            width: parent.width
+            title: "OmaRecorder"
+            meta: root.stateText
+            foreground: root.foreground
+            fontFamily: root.fontFamily
+            iconComponent: Component {
+              Text {
+                textFormat: Text.PlainText
+                text: hero.rec ? "󰑊" : (hero.busy ? "󰔟" : "󰕽")
+                color: hero.rec ? hero.recColor : (hero.busy ? Color.accent : hero.foreground)
+                font.family: hero.fontFamily
+                font.pixelSize: Style.font.display
+              }
+            }
+          }
+
+          LevelMeter {
+            visible: root.recording
+            width: parent.width
+            peakDb: root.ready ? root.svc.peakDb : -99
+            clipping: root.ready && root.svc.clipping
+            foreground: root.foreground
+            urgent: root.urgent
+            fontFamily: root.fontFamily
+          }
+
+          Row {
+            visible: root.ready && root.svc.lastError.length > 0
+            width: parent.width
+            spacing: Style.spacing.sm
+            Text {
+              width: parent.width - dismissError.width - parent.spacing
+              text: root.ready ? root.svc.lastError : ""
+              textFormat: Text.PlainText
+              color: root.urgent
+              font.family: root.fontFamily
+              font.pixelSize: Style.font.caption
+              wrapMode: Text.Wrap
+            }
+            AccessibleActionButton {
+              id: dismissError
+              anchors.verticalCenter: parent.verticalCenter
+              iconText: "󰅖"
+              tooltipText: "Dismiss this message (x)"
+              foreground: root.dim
+              fontFamily: root.fontFamily
+              onClicked: if (root.ready) root.svc.clearError()
+            }
+          }
+
+          SetupCard {
+            width: parent.width
+            svc: root.svc
+            foreground: root.foreground
+            urgent: root.urgent
+            fontFamily: root.fontFamily
+          }
+
+          Dropdown {
+            id: sourceDropdown
+            visible: root.ready && !root.recording
+            width: parent.width
+            label: "Source"
+            // Say what each option captures: a mic on speakers hears the computer too.
+            options: root.sources
+            foreground: root.foreground
+            fontFamily: root.fontFamily
+            onChanged: function(v) { root.svc.setConfig("defaultSource", v) }
+            // The kit's Dropdown assigns its own value on a pick, which cut a
+            // plain `value:` binding: after a pick, `c` changed the source but
+            // not what this showed.
+            Binding { target: sourceDropdown; property: "value"; value: root.ready ? root.svc.defaultSource : "mic" }
+          }
+
+          Button {
+            width: parent.width
+            text: root.recording ? "Stop recording  (r)" : "Start recording  (r)"
+            iconText: root.recording ? "󰓛" : "󰑊"
+            active: root.recording
+            foreground: root.recording ? root.urgent : root.foreground
+            fontFamily: root.fontFamily
+            enabled: root.ready
+            // The button stops without the long-take confirmation the
+            // keyboard and right-click paths get; clicking it is deliberate.
+            onClicked: root.recording ? root.svc.stopRecording(true) : root.toggleRecording()
+          }
+
+          // Resume the last stopped take (#49): a full-width button in the
+          // same family as Record, directly below it, shown only while the
+          // CLI offers one. Record and the toggle always start fresh;
+          // resuming is its own deliberate action. The label stays generic
+          // (an untitled take's display title carries a date and read badly
+          // when it got cut off); the take's title lives in the tooltip, and
+          // the label is elided up front because the kit button cannot.
+          Button {
+            id: resumeButton
+            visible: root.ready && !root.recording && root.svc.resumable
+            width: parent.width
+            text: resumeLabel.elidedText
+            iconText: "󰑊"
+            foreground: root.foreground
+            fontFamily: root.fontFamily
+            tooltipText: root.ready ? root.svc.resumeTitle : ""
+            onClicked: root.svc.resumeRecording()
+            TextMetrics {
+              id: resumeLabel
+              font.family: root.fontFamily
+              font.pixelSize: resumeButton.fontSize
+              elide: Text.ElideRight
+              // The room the label really has: button width minus the icon,
+              // the row gap, the paddings and the reserved border.
+              elideWidth: Math.max(60, resumeButton.width - resumeButton.horizontalPadding * 2 - Style.font.icon - Style.spacing.controlGap * 2)
+              text: root.ready ? "Resume last recording · stopped " + root.svc.resumeAgoText + "  (u)" : ""
+            }
+          }
+
+          PanelSeparator { width: parent.width; foreground: root.foreground }
+
+          PanelSectionHeader {
+            text: root.settingsOpen ? "RECENT · hidden while settings are open" : "RECENT"
+            foreground: root.foreground
+            fontFamily: root.fontFamily
+          }
+
+          Text {
+            visible: root.recent.length === 0 && !root.settingsOpen
+            width: parent.width
+            // "Off" only when it is: during the very first recording Recent is
+            // empty too (the live take is the hero line), and said "off".
+            text: !root.ready ? "Service not loaded."
+              : root.svc.recordings.length === 0 ? "No recordings yet. Press r to start one."
+              : root.recentCount === 0 ? "The Recent list is off. To show it again: omarchy bar set " + root.moduleName + " recentCount 5"
+              : "Nothing else yet."
+            textFormat: Text.PlainText
+            wrapMode: Text.Wrap
+            color: root.dim
+            font.family: root.fontFamily
+            font.pixelSize: Style.font.caption
+          }
+
+          Column {
+            id: recentColumn
+            width: parent.width
+            spacing: Style.spacing.xxs
+            visible: !root.settingsOpen
+            Repeater {
+              model: root.recent
+              delegate: RecordingRow {
+                required property var modelData
+                required property int index
+                width: recentColumn.width
+                rec: modelData
+                svc: root.svc
+                foreground: root.foreground
+                dimColor: root.dim
+                fontFamily: root.fontFamily
+                current: root.cursorActive && root.cursorIndex === index
+                urgent: root.urgent
+                onClicked: { root.cursorActive = true; root.cursorIndex = index; root.openLibrary(modelData.id) }
+                onTranscribeRequested: root.svc.transcribe(modelData.id)
+                onOpenRequested: root.svc.openTranscript(modelData.id)
+              }
+            }
+          }
+
+          Row {
+            width: parent.width
+            spacing: Style.spacing.sm
+            Button {
+              width: parent.width - gear.width - importButton.width - parent.spacing * 2
+              text: "Open library  (l)"
+              iconText: "󰈔"
+              foreground: root.foreground
+              fontFamily: root.fontFamily
+              enabled: root.ready
+              onClicked: root.openLibrary()
+            }
+            AccessibleActionButton {
+              id: importButton
+              anchors.verticalCenter: parent.verticalCenter
+              iconText: "󰋺"
+              tooltipText: "Import an audio file (i)"
+              foreground: root.foreground
+              fontFamily: root.fontFamily
+              enabled: root.ready
+              onClicked: root.importAudio()
+            }
+            AccessibleActionButton {
+              id: gear
+              anchors.verticalCenter: parent.verticalCenter
+              iconText: "󰒓"
+              tooltipText: "Settings (s)"
+              foreground: root.settingsOpen ? Color.accent : root.foreground
+              fontFamily: root.fontFamily
+              onClicked: root.settingsOpen = !root.settingsOpen
+            }
+          }
+
+          Column {
+            visible: root.importOpen && root.ready
+            width: parent.width
+            spacing: Style.spacing.xxs
+            Text { textFormat: Text.PlainText; width: parent.width; wrapMode: Text.Wrap; text: "Import an audio file: type a path, Enter imports, Esc cancels"; color: root.dim; font.family: root.fontFamily; font.pixelSize: Style.font.caption }
+            TextField {
+              id: importField
+              width: parent.width
+              placeholderText: "~/Downloads/meeting.m4a"
+              foreground: root.foreground
+              font.family: root.fontFamily
+              onAccepted: { if (text.trim().length) { root.svc.importFile(text.trim()); text = ""; root.importOpen = false }; keyCatcher.forceActiveFocus() }
+              Keys.onEscapePressed: { root.importOpen = false; keyCatcher.forceActiveFocus() }
+            }
+          }
+
+          // Until the import finishes: converting a long file takes a while,
+          // and the popup had nothing on screen to say it was working.
+          Text {
+            visible: root.ready && root.svc.importing.length > 0
+            width: parent.width
+            text: root.ready ? State.importingText(root.svc.importing) : ""
+            textFormat: Text.PlainText
+            elide: Text.ElideMiddle
+            color: Color.accent
+            font.family: root.fontFamily
+            font.pixelSize: Style.font.caption
+          }
+
+          PanelSeparator { visible: root.settingsOpen && root.ready; width: parent.width; foreground: root.foreground }
+
+          SettingsSection {
+            id: settingsSection
+            onCursorMoved: function(item) { root.settingsFollowBottom = false; root.ensureVisible(item) }
+            onDoneEditing: keyCatcher.forceActiveFocus()
+            visible: root.settingsOpen && root.ready
+            width: parent.width
+            svc: root.svc
+            foreground: root.foreground
+            fontFamily: root.fontFamily
+          }
+
+        }
+      }
+
+      // The key legend is pinned below the scroll area, so it stays visible
+      // while the settings (or a long Recent list) scroll above it.
+      Text {
+        textFormat: Text.PlainText
+        id: keyLegend
+        anchors.left: parent.left
+        anchors.right: parent.right
+        anchors.bottom: parent.bottom
+        horizontalAlignment: Text.AlignHCenter
+        // Wraps to a second centered line when the panel is narrow. The
+        // non-breaking spaces keep each key with its word and each dot with
+        // the item before it, so a wrap only happens after a dot: never
+        // between "d" and "dictionary", and no line starts with a dot.
+        wrapMode: Text.Wrap
+        text: root.settingsOpen ? "↑↓ move · Enter change · d dictionary · s settings · Esc close"
+              : "r record · " + (!root.settingsOpen && root.recent.length ? "↑↓ Enter recent · " : "") + (root.ready && root.svc.resumable && !root.recording ? "u resume · " : "")
+              + (root.ready && !root.recording ? "c source · " : "") + "l library · i import · s settings · d dictionary · "
+              + (root.ready && root.svc.lastError.length > 0 ? "x dismiss · " : "") + "Esc close"
+        color: root.dim
+        font.family: root.fontFamily
+        font.pixelSize: Style.font.caption
+      }
+    }
+  }
+}

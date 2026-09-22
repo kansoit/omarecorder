@@ -1,0 +1,48 @@
+{
+  "schemaVersion": 1,
+  "id": "io.github.huey-holdings-llc.omarecorder",
+  "name": "OmaRecorder",
+  "version": "1.5.0",
+  "author": "Corey Tyhurst",
+  "license": "MIT",
+  "description": "A local-only recorder and transcriber built from what Omarchy already ships.",
+  "kinds": [
+    "service",
+    "bar-widget",
+    "overlay"
+  ],
+  "keepLoaded": true,
+  "entryPoints": {
+    "service": "Service.qml",
+    "barWidget": "Panel.qml",
+    "overlay": "Library.qml"
+  },
+  "barWidget": {
+    "displayName": "OmaRecorder",
+    "description": "One-click audio recording with a local transcription library.",
+    "category": "Productivity",
+    "aliases": [
+      "recorder",
+      "record",
+      "transcribe",
+      "meeting"
+    ],
+    "allowMultiple": false,
+    "defaultSection": "right",
+    "defaults": {
+      "recentCount": 5
+    },
+    "schema": [
+      {
+        "key": "recentCount",
+        "type": "integer",
+        "label": "Recent recordings shown in popup",
+        "min": 0,
+        "max": 10,
+        "step": 1,
+        "defaultValue": 5
+      }
+    ]
+  },
+  "homepage": "https://github.com/huey-holdings-llc/omarecorder"
+}

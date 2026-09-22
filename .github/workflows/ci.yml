@@ -1,0 +1,48 @@
+name: ci
+
+# The token gets read access and nothing else; this workflow needs no secrets.
+permissions:
+  contents: read
+on:
+  push:
+    branches: [main, "release/**"]
+  pull_request:
+
+jobs:
+  lint-and-test:
+    runs-on: ubuntu-latest
+    container: archlinux:latest
+    timeout-minutes: 20
+    steps:
+      - name: Install tools (what an Omarchy install already has)
+        run: pacman -Syu --noconfirm --needed git jq ffmpeg shellcheck glib2 diffutils perl nodejs
+      - uses: actions/checkout@v4
+      - name: Static checks
+        env:
+          # qmllint (no omarchy shell modules here) and omarchy-plugin-validate
+          # (not packaged) are the only checks that may skip in this container.
+          # Anything else going quiet is a bug, so lint fails on a different count.
+          # The kit-token check needs the shell's Style.qml too, so it skips here.
+          LINT_EXPECT_SKIPS: "3"
+        run: bash tests/lint.sh
+      - name: CLI tests (no voxtype, no microphone, and root owns every folder here, so three blocks skip)
+        env:
+          OMARECORDER_TEST_ALLOW_SKIP: "1"
+          # How many blocks skip in this container. A different count fails the
+          # run: a block that went quiet is a bug, not a pass (lint does the same).
+          OMARECORDER_TEST_EXPECT_SKIPS: "3"
+          XDG_RUNTIME_DIR: /tmp/xdg-runtime-ci
+          OMARECORDER_TEST_TMP: /root/omarecorder-tests
+          HOME: /root
+        run: |
+          mkdir -m 700 -p "$XDG_RUNTIME_DIR"
+          git config --global --add safe.directory "$PWD"
+          bash tests/cli.test.sh
+      - name: Keep the sandbox when something failed (the CLI log and the recordings under test)
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-sandbox
+          path: /root/omarecorder-tests
+          if-no-files-found: ignore
+          retention-days: 7
