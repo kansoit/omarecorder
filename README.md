@@ -1,7 +1,7 @@
 # OmaRecorder
 
 Record conversations and meetings from the Omarchy bar, keep the audio, and
-transcribe it locally, later, with the voxtype/whisper engine Omarchy already
+transcribe it locally, later, with any transcription engine Voxtype provides.
 ships. One click to record, a library to browse, a transcript beside every
 recording, and a note in Obsidian when you want one. Nothing leaves your machine.
 
@@ -385,21 +385,23 @@ Obsidian strip it.
 | Config | `~/.config/omarecorder/config.json` (popup settings, or `omarecorder config set ...`) |
 | Speed measurements | `~/.local/state/omarecorder/bench.json` (per model, from takes of 60 s or more) |
 | Log | `~/.local/state/omarecorder/omarecorder.log`, rotated to `.log.1` at 1 MB |
-| whisper stderr of a failed job | `~/.local/state/omarecorder/tx-<id>.err` (kept only on failure) |
+| transcription stderr of a failed job | `~/.local/state/omarecorder/tx-<id>.err` (kept only on failure) |
 | Runtime state | `$XDG_RUNTIME_DIR/omarecorder/`: `state.json`, `state.lock`, `level`, `play.pid`, `mpv.sock`, `tx-<id>.*` while a transcription runs, `open/<id>` links for the editor. Never `/tmp` |
 
 Config keys (`omarecorder config get --json`): `recordingsDir` (`~/Recordings`),
-`defaultSource` (`mic`), `defaultModel` (`base.en`), `language` (`en`),
+`defaultSource` (`mic`), `engine` (the active Voxtype engine, normally
+`whisper` or `parakeet`), `defaultModel` (the model for that engine), `language` (`en`),
 `keepAwake` (`true`, a systemd idle/sleep inhibitor while recording),
 `autoTranscribe` (`false`; when `true`, stopping a recording starts a
-transcription with the default model, but only if that model is already
+transcription with the selected engine and model, but only if that model is already
 downloaded), `enhanceAudio` (`false`; when `true`, transcription runs an
 audio cleanup pass, a highpass filter, noise reduction and loudness
 normalization, on a temporary copy of the audio and transcribes that copy;
 `audio.wav` is never modified, and `transcribe <id> --enhance` /
 `--no-enhance` override the setting for one run), `threads` (`0` lets voxtype
 decide), `obsidianVault` (empty = the open vault), `exportDir` (empty =
-automatic). `defaultModel` has to name one of the three presets, `language` has
+automatic). `defaultModel` has to name a model exposed by the selected Voxtype
+engine, `language` has
 to be `auto` or a two-letter code, and `exportDir` has to not be an existing
 file; the directory itself is created on the first export.
 
@@ -411,18 +413,18 @@ you made beats a vault the plugin guessed at.
 Environment: `OMARECORDER_DIR` overrides `recordingsDir`, `OMARECORDER_CHUNK_S`
 sets the piece length.
 
-### Models
+### Engines and models
 
-Three presets, mapped to voxtype's whisper models: Fast = `base.en` (142 MB),
-Balanced = `small.en` (466 MB), Accurate = `large-v3-turbo` (1.6 GB). Downloads
-run `voxtype setup --download` in a `systemd-run --user` unit. Estimates start
-from a default speed and are replaced by what your machine measured the first
-time each model transcribes a take of 60 seconds or more.
+The settings panel first selects a Voxtype engine, then shows the models
+published by that engine. OmaRecorder reads this catalog from `voxtype info
+models --json`; it does not maintain a second hardcoded model list. Downloads
+run through Voxtype in a `systemd-run --user` unit. Estimates start from a
+default speed and are replaced by what your machine measured the first time
+each model transcribes a take of 60 seconds or more.
 
-Fast and Balanced are English-only models (the `.en` in their names). For any
-other language, or with `language` set to `auto`, use Accurate. The Library
-says so when the language setting and the chosen preset disagree, and
-`transcribe` prints a warning.
+Language controls are engine-specific. Whisper uses its configured language;
+Parakeet detects among its supported European languages, including Spanish,
+and does not use Whisper's language setting.
 
 ### CLI
 

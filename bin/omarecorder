@@ -52,15 +52,15 @@ CHUNK_S="${OMARECORDER_CHUNK_S:-1800}"
 STOP_CONFIRM_S="${OMARECORDER_STOP_CONFIRM_S:-3600}"
 [[ "$STOP_CONFIRM_S" =~ ^[0-9]+$ ]] || STOP_CONFIRM_S=3600
 
-# The three presets OmaRecorder offers (voxtype can download more, but three
-# clear choices beat a list of eight). size_mb from ggml file sizes; rtf =
-# default realtime factor (audio seconds per wall second), replaced by
-# measured values in bench.json after the first run on this machine.
+# Fallback catalog used only with older Voxtype builds (or the test doubles).
+# Current Voxtype is the source of truth: `voxtype info models --json` exposes
+# every engine, model and installed state. `engine` is Voxtype's term for what
+# the UI calls the provider.
 MODEL_CATALOG='[
-  {"name":"base.en","size_mb":142,"rtf":10,"label":"Fast"},
-  {"name":"small.en","size_mb":466,"rtf":4,"label":"Balanced"},
-  {"name":"small","size_mb":466,"rtf":2,"label":"Multilingual"},
-  {"name":"large-v3-turbo","size_mb":1600,"rtf":3,"label":"Accurate"}
+  {"engine":"whisper","name":"base.en","size_mb":142,"rtf":10,"label":"base.en"},
+  {"engine":"whisper","name":"small.en","size_mb":466,"rtf":4,"label":"small.en"},
+  {"engine":"whisper","name":"small","size_mb":466,"rtf":2,"label":"small"},
+  {"engine":"whisper","name":"large-v3-turbo","size_mb":1600,"rtf":3,"label":"large-v3-turbo"}
 ]'
 
 # -------------------------------------------------------------- helpers -----
@@ -121,7 +121,7 @@ strip_header() { sed '1{/^<!--/d}' "$1"; }
 
 # ---------------------------------------------------------------- config ----
 CONFIG_DEFAULTS=$(jq -cn --arg dir "${OMARECORDER_DIR:-$HOME/Recordings}" '{
-  recordingsDir: $dir, defaultSource: "mic", defaultModel: "base.en",
+  recordingsDir: $dir, defaultSource: "mic", engine: "whisper", defaultModel: "base.en",
   language: "en", keepAwake: true, threads: 0, autoTranscribe: false,
   enhanceAudio: false, obsidianVault: "", exportDir: "" }')   # "" = automatic (see resolve_export_target)
 
@@ -129,6 +129,25 @@ load_config() {
   local file='{}'
   [[ -f "$CONFIG_FILE" ]] && file=$(jq -c . "$CONFIG_FILE" 2>/dev/null || echo '{}')
   CONFIG=$(jq -cn --argjson d "$CONFIG_DEFAULTS" --argjson f "$file" '$d + $f')
+  # A first run follows Voxtype's active engine/model, so installing Parakeet
+  # does not make OmaRecorder silently fall back to Whisper. Existing explicit
+  # OmaRecorder choices always win.
+  if have voxtype; then
+    local ve vm
+    ve=$(voxtype config get engine 2>/dev/null || true)
+    voxtype_engine_known "$ve" || ve=""
+    local legacy_engine_missing=false
+    [[ "$(jq -r 'has("engine")' <<<"$file")" == true ]] || legacy_engine_missing=true
+    if [[ -n "$ve" && "$legacy_engine_missing" == true ]]; then
+      CONFIG=$(jq -c --arg e "$ve" '.engine=$e' <<<"$CONFIG")
+    fi
+    [[ -n "$ve" ]] || ve=$(jq -r '.engine' <<<"$CONFIG")
+    vm=$(voxtype config get "$ve.model" 2>/dev/null || true)
+    if [[ -n "$vm" ]] && model_known_for "$ve" "$vm" \
+      && [[ "$(jq -r 'has("defaultModel")' <<<"$file")" != true || "$legacy_engine_missing" == true ]]; then
+      CONFIG=$(jq -c --arg m "$vm" '.defaultModel=$m' <<<"$CONFIG")
+    fi
+  fi
   # OMARECORDER_DIR env always wins (tests, one-off runs)
   if [[ -n "${OMARECORDER_DIR:-}" ]]; then
     CONFIG=$(jq -c --arg dir "$OMARECORDER_DIR" '.recordingsDir = $dir' <<<"$CONFIG")
@@ -169,7 +188,8 @@ cmd_config() {
           mkdir -p -- "$d" 2>/dev/null || true
           [[ -d "$d" && -w "$d" ]] || die "recordingsDir must be a writable folder (it could not be created): $val" ;;
         obsidianVault) [[ -z "$val" || -d "${val/#\~/$HOME}" ]] || die "obsidianVault must be an existing directory (or \"\" for automatic): $val" ;;
-        defaultModel) model_known "$val" \
+        engine) voxtype_engine_known "$val" || die "unknown Voxtype engine: $val" ;;
+        defaultModel) model_known_for "$(cfg engine)" "$val" \
           || die "unknown model: $val (see: omarecorder models)" ;;
         language) [[ "$val" =~ ^(auto|[a-z][a-z])$ ]] || die "language must be auto or a two-letter code (en, de, fr)" ;;
         exportDir) local ed="${val/#\~/$HOME}"
@@ -181,7 +201,14 @@ cmd_config() {
         threads) [[ "$val" =~ ^[0-9]+$ ]] || die "threads must be an integer" ;;
         *) die "unknown config key: $key" ;;
       esac
-      with_lock _write_config "$key" "$val"; load_config; bump_state; echo "$key=$val" ;;
+      with_lock _write_config "$key" "$val"
+      load_config
+      if [[ "$key" == engine ]] && ! model_known_for "$val" "$(cfg defaultModel)"; then
+        local next_model; next_model=$(jq -r --arg e "$val" 'map(select(.engine==$e)) | (map(select(.installed==true)) + .) | .[0].name // empty' <<<"$(model_catalog_json)")
+        [[ -n "$next_model" ]] && with_lock _write_config defaultModel "$next_model"
+        load_config
+      fi
+      bump_state; echo "$key=$val" ;;
     *) die "usage: config get [key|--json] | config set <key> <value>" ;;
   esac
 }
@@ -1804,54 +1831,84 @@ cmd_tidy() { # tidy <id>: (re)build transcript.tidy.md
 transcript_file() { if [[ "${2:-}" != "raw" && -s "$1/transcript.tidy.md" ]]; then echo "$1/transcript.tidy.md"; else echo "$1/transcript.md"; fi; }
 
 # --------------------------------------------------------------- models ----
-model_installed() { [[ -f "$VOXTYPE_MODELS_DIR/ggml-$1.bin" ]]; }
-model_catalog_has() { jq -e --arg m "$1" 'any(.[]; .name == $m)' <<<"$MODEL_CATALOG" >/dev/null; }
-model_known() { model_catalog_has "$1" || model_installed "$1"; }
-discover_installed_models() {
-  local f name
-  shopt -s nullglob
-  for f in "$VOXTYPE_MODELS_DIR"/ggml-*.bin; do
-    name=${f##*/}; name=${name#ggml-}; name=${name%.bin}
-    [[ "$name" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]] && printf '%s\n' "$name"
-  done | sort -u
+voxtype_engine_known() {
+  local engine="$1" raw
+  [[ "$engine" =~ ^[a-z][a-z0-9_-]*$ ]] || return 1
+  raw=$(have voxtype && voxtype info engines --json 2>/dev/null || true)
+  if [[ -n "$raw" ]] && jq -e 'type == "array"' <<<"$raw" >/dev/null 2>&1; then
+    jq -e --arg e "$engine" 'any(.[]; .name==$e and .compiled==true)' <<<"$raw" >/dev/null
+    return $?
+  fi
+  case "$engine" in
+    whisper|parakeet|moonshine|sensevoice|paraformer|dolphin|omnilingual|cohere|openvino|soniox) return 0 ;;
+    *) return 1 ;;
+  esac
 }
-model_label() { # "Fast (base.en)" or just the name
-  local l; l=$(jq -r --arg m "$1" '.[] | select(.name==$m) | .label' <<<"$MODEL_CATALOG")
-  [[ -n "$l" ]] && echo "$l ($1)" || echo "$1"
+voxtype_models_json() { have voxtype && voxtype info models --json 2>/dev/null; }
+
+# Current Voxtype is the source of truth. The fallback keeps old Voxtype builds
+# and the test doubles usable, but new engines/models must not require a plugin
+# release just to become visible.
+model_catalog_json() {
+  local raw; raw=$(voxtype_models_json || true)
+  if [[ -n "$raw" ]] && jq -e '.engines | type == "object"' <<<"$raw" >/dev/null 2>&1; then
+    jq -c '[.engines | to_entries[] as $e | $e.value.models[] |
+      {engine:$e.key, name:.name, download_arg:(.download_arg // .name),
+       installed:(.installed == true), downloadable:(.downloadable != false),
+       size_mb:(.size_mb // 0),
+       rtf:(if $e.key == "whisper" and .name == "base.en" then 10
+            elif $e.key == "whisper" and .name == "small.en" then 4
+            elif $e.key == "whisper" and .name == "small" then 2
+            elif $e.key == "whisper" and .name == "large-v3-turbo" then 3
+            else 3 end), label:.name}]' <<<"$raw"
+  else
+    jq -c '.' <<<"$MODEL_CATALOG"
+  fi
 }
-model_rtf() { # measured or default
+model_installed_for() {
+  local engine="$1" name="$2" raw
+  raw=$(model_catalog_json)
+  jq -e --arg e "$engine" --arg m "$name" 'any(.[]; .engine==$e and .name==$m and .installed==true)' <<<"$raw" >/dev/null && return 0
+  [[ "$engine" == whisper && -f "$VOXTYPE_MODELS_DIR/ggml-$name.bin" ]]
+}
+model_installed() { model_installed_for "$(cfg engine)" "$1"; }
+model_catalog_has() { jq -e --arg e "$1" --arg m "$2" 'any(.[]; .engine==$e and .name==$m)' <<<"$(model_catalog_json)" >/dev/null; }
+model_known_for() { model_catalog_has "$1" "$2" || model_installed_for "$1" "$2"; }
+model_known() { model_known_for "$(cfg engine)" "$1"; }
+model_label() {
+  local engine="${2:-$(cfg engine)}" label
+  label=$(jq -r --arg e "$engine" --arg m "$1" '.[] | select(.engine==$e and .name==$m) | .label' <<<"$(model_catalog_json)" | head -1)
+  [[ -n "$label" && "$label" != "null" ]] && echo "$label" || echo "$1"
+}
+model_rtf() {
   local m="$1" v=""
-  [[ -f "$BENCH_FILE" ]] && v=$(jq -r --arg m "$m" '.[$m].rtf // empty' "$BENCH_FILE" 2>/dev/null)
+  [[ -f "$BENCH_FILE" ]] && v=$(jq -r --arg m "$(cfg engine):$m" '.[$m].rtf // empty' "$BENCH_FILE" 2>/dev/null)
+  [[ -n "$v" ]] || [[ -f "$BENCH_FILE" ]] && v=$(jq -r --arg m "$m" '.[$m].rtf // empty' "$BENCH_FILE" 2>/dev/null)
   [[ -n "$v" ]] && { echo "$v"; return 0; }
-  v=$(jq -r --arg m "$m" '.[] | select(.name==$m) | .rtf // empty' <<<"$MODEL_CATALOG")
+  v=$(jq -r --arg e "$(cfg engine)" --arg m "$m" '.[] | select(.engine==$e and .name==$m) | .rtf // empty' <<<"$(model_catalog_json)")
   echo "${v:-3}"
+}
+# Voxtype 1.1 keeps engine/model/language in its resolved config; the
+# transcribe subcommand intentionally does not accept --model/--language.
+# Apply OmaRecorder's selected engine before starting a job. Parakeet and the
+# other ONNX engines do not use Whisper's language setting.
+voxtype_configure() {
+  local engine="$1" model="$2" lang="${3:-auto}"
+  have voxtype || return 0
+  voxtype config set engine "$engine" >/dev/null 2>&1 || return 1
+  voxtype config set "$engine.model" "$model" >/dev/null 2>&1 || return 1
+  case "$engine" in
+    whisper|sensevoice|cohere) voxtype config set "$engine.language" "$lang" >/dev/null 2>&1 || return 1 ;;
+  esac
 }
 cmd_models() {
   local as_json=0; want_json "$@" && as_json=1
   local bench='{}'; [[ -f "$BENCH_FILE" ]] && bench=$(jq -c . "$BENCH_FILE")
-  local out; out=$(jq -c --arg mdir "$VOXTYPE_MODELS_DIR" --argjson bench "$bench" --arg def "$(cfg defaultModel)" '
-    map(. + {installed: false, default: (.name == $def), rtf_source: "default"}
-        | if $bench[.name] then .rtf = $bench[.name].rtf | .rtf_source = "measured" else . end)' <<<"$MODEL_CATALOG")
-  local res='[]' m name
-  while IFS= read -r m; do
-    name=$(jq -r '.name' <<<"$m")
-    if model_installed "$name"; then m=$(jq -c '.installed=true' <<<"$m"); fi
-    res=$(jq -c --argjson m "$m" '. + [$m]' <<<"$res")
-  done < <(jq -c '.[]' <<<"$out")
-  # The catalog supplies optional metadata. The files installed by Voxtype
-  # are the source of truth for what can actually be selected.
-  while IFS= read -r name; do
-    [[ -n "$name" ]] || continue
-    jq -e --arg n "$name" '.[] | select(.name == $n)' <<<"$res" >/dev/null && continue
-    local bytes size_mb
-    bytes=$(stat -c %s "$VOXTYPE_MODELS_DIR/ggml-$name.bin" 2>/dev/null || echo 0)
-    size_mb=$(( (bytes + 999999) / 1000000 ))
-    m=$(jq -cn --arg n "$name" --argjson size "$size_mb" '{name:$n, size_mb:$size, rtf:3, label:null,
-      installed:true, default:false, rtf_source:"default"}')
-    res=$(jq -c --argjson m "$m" '. + [$m]' <<<"$res")
-  done < <(discover_installed_models)
-  if (( as_json )); then jq . <<<"$res"; return 0; fi
-  jq -r '.[] | "\(if .installed then "✓" else " " end) \(.name)\t\(.size_mb) MB\t~\(.rtf)x realtime (\(.rtf_source))\t\(.label)"' <<<"$res"
+  local engine; engine="$(cfg engine)"; local out; out=$(jq -c --argjson bench "$bench" --arg e "$engine" --arg def "$(cfg defaultModel)" '
+    map(. + {default: (.engine == $e and .name == $def), rtf_source: "default"}
+        | if $bench[.name] then .rtf = $bench[.name].rtf | .rtf_source = "measured" else . end)' <<<"$(model_catalog_json)")
+  if (( as_json )); then jq . <<<"$out"; return 0; fi
+  jq -r '.[] | "\(if .installed then "✓" else " " end) \(.engine)/\(.name)\t\(.size_mb) MB\t~\(.rtf)x realtime\t\(.label)"' <<<"$out"
 }
 
 cmd_model() {
@@ -1862,8 +1919,9 @@ cmd_model() {
       start_download "$name" "" ;;
     cancel)
       local name="${1:-}"; [[ -n "$name" ]] || die "usage: model cancel <name>"
-      jq -e --arg m "$name" '.[] | select(.name==$m)' <<<"$MODEL_CATALOG" >/dev/null || die "unknown model: $name"
+      model_catalog_has "$(cfg engine)" "$name" || die "unknown model: $name"
       local unit="omarecorder-dl-${name//./-}" was=0
+      [[ "$(cfg engine)" == whisper ]] || unit="omarecorder-dl-$(cfg engine)-${name//./-}"
       unit_active "$unit" && was=1
       systemctl --user stop "$unit" 2>/dev/null || true
       systemctl --user reset-failed "$unit" 2>/dev/null || true
@@ -1895,18 +1953,21 @@ cmd_model() {
 # chains a transcription onto the finished download; empty means plain.
 start_download() {
   local name="$1" then_json="${2:-}"
-  jq -e --arg m "$name" '.[] | select(.name==$m)' <<<"$MODEL_CATALOG" >/dev/null || die "unknown model: $name"
-  model_installed "$name" && { echo "already installed: $name"; return 0; }
+  local engine; engine=$(cfg engine)
+  model_catalog_has "$engine" "$name" || die "unknown model: $name for engine $engine"
+  model_installed_for "$engine" "$name" && { echo "already installed: $name"; return 0; }
   have voxtype || die "voxtype not installed"
   reconcile_state
   local unit="omarecorder-dl-${name//./-}" size rc=0
-  size=$(jq -r --arg m "$name" '.[] | select(.name==$m) | .size_mb' <<<"$MODEL_CATALOG")
+  [[ "$engine" == whisper ]] || unit="omarecorder-dl-${engine}-${name//./-}"
+  size=$(jq -r --arg e "$engine" --arg m "$name" '.[] | select(.engine==$e and .name==$m) | .size_mb' <<<"$(model_catalog_json)")
+  [[ "$size" =~ ^[0-9]+$ ]] || size=0
   with_lock _claim_dl "$name" "$then_json" "$unit" $((size * 1000000)) || rc=$?
   case "$rc" in
     1) die "download already running" ;;
     2) log "model download $name: chained transcribe re-aimed"; echo "downloading $name"; return 0 ;;
   esac
-  if ! run_detached "$unit" "OmaRecorder download $name" "$SELF" _dl-worker "$name"; then
+  if ! run_detached "$unit" "OmaRecorder download $engine/$name" "$SELF" _dl-worker "$engine" "$name"; then
     state_set --arg m "$name" '.jobs |= map(select(.type != "download" or .model != $m))'
     die "could not start the download"
   fi
@@ -1925,19 +1986,26 @@ run_detached() {
 }
 
 _dl_worker() {
-  local name="$1" b; local f="$VOXTYPE_MODELS_DIR/ggml-$name.bin"
+  local engine name b; local f
+  if (( $# == 1 )); then engine=whisper; name="$1"; else engine="$1"; name="$2"; fi
+  f="$VOXTYPE_MODELS_DIR/$name"
   # model cancel stops the unit and owns the job removal; a TERM here is a
   # clean exit, not a failure (mirrors _tx_worker's trap contract).
   trap 'exit 0' TERM INT HUP
+  voxtype config set engine "$engine" >>"$LOG_FILE" 2>&1 || true
+  voxtype config set "$engine.model" "$name" >>"$LOG_FILE" 2>&1 || true
   voxtype setup --download --model "$name" --quiet --no-post-install >>"$LOG_FILE" 2>&1 &
   local child=$!
   # Progress = bytes on disk, published into the job entry every 2 s (the UI
   # only watches state.json; nothing polls the model directory).
   while pid_alive "$child"; do
-    sleep 2; b=0; [[ -f "$f" ]] && b=$(file_size "$f"); [[ -f "$f.part" ]] && b=$(file_size "$f.part")
+    sleep 2; b=0
+    if [[ -f "$f" ]]; then b=$(file_size "$f")
+    elif [[ -d "$f" ]]; then b=$(du -sb -- "$f" 2>/dev/null | awk '{print $1}' || echo 0)
+    elif [[ -f "$f.part" ]]; then b=$(file_size "$f.part"); fi
     state_set --arg m "$name" --argjson b "$b" '.jobs |= map(if .type=="download" and .model==$m then .bytes_done=$b else . end)' || true
   done
-  local ok=0; wait "$child" && model_installed "$name" && ok=1
+  local ok=0; wait "$child" && model_installed_for "$engine" "$name" && ok=1
   # Take the chain intent and drop our own job atomically (transcribe
   # --download may have re-aimed the intent right up to this moment).
   # cmd_list never reconciles, so a job left behind kept the UI saying
@@ -1996,13 +2064,13 @@ cmd_estimate() {
 
 # ----------------------------------------------------------- transcribe ----
 cmd_transcribe() {
-  local id="${1:-}"; [[ -n "$id" ]] || die "usage: transcribe <id> [--model M] [--language L] [--threads N] [--from s --to s] [--chunk-s N] [--enhance|--no-enhance] [--download]"; shift
-  local model; model=$(cfg defaultModel); local lang; lang=$(cfg language); local threads; threads=$(cfg threads); local from="" to="" dl=0 chunk_s=""
+  local id="${1:-}"; [[ -n "$id" ]] || die "usage: transcribe <id> [--engine E] [--model M] [--language L] [--threads N] [--from s --to s] [--chunk-s N] [--enhance|--no-enhance] [--download]"; shift
+  local engine; engine=$(cfg engine); local model; model=$(cfg defaultModel); local lang; lang=$(cfg language); local threads; threads=$(cfg threads); local from="" to="" dl=0 chunk_s=""
   # The cleanup pass (#48): config default, overridden per run by the flags.
   local enhance; enhance=$(cfg enhanceAudio)
   while [[ $# -gt 0 ]]; do
     case "$1" in
-      --model) need_val "$@"; model="$2"; shift 2 ;; --language) need_val "$@"; lang="$2"; shift 2 ;;
+      --engine) need_val "$@"; engine="$2"; shift 2 ;; --model) need_val "$@"; model="$2"; shift 2 ;; --language) need_val "$@"; lang="$2"; shift 2 ;;
       --threads) need_val "$@"; threads="$2"; shift 2 ;;
       --from) need_val "$@"; from="$2"; shift 2 ;; --to) need_val "$@"; to="$2"; shift 2 ;;
       --chunk-s) need_val "$@"; chunk_s="$2"; shift 2 ;;
@@ -2016,6 +2084,8 @@ cmd_transcribe() {
   [[ -z "$to" ]] || valid_seconds "$to" || die "--to must be a non-negative number of seconds"
   [[ -z "$from" || -z "$to" ]] || awk -v a="$from" -v b="$to" 'BEGIN{exit !(b > a)}' || die "--to must be greater than --from"
   [[ -z "$chunk_s" || "$chunk_s" =~ ^[1-9][0-9]*$ ]] || die "--chunk-s must be a positive integer of seconds"
+  [[ "$engine" =~ ^[a-z][a-z0-9_-]*$ ]] || die "engine must be a valid Voxtype engine"
+  model_known_for "$engine" "$model" || die "unknown model: $model for engine $engine (see: omarecorder models)"
   local dir; dir=$(require_dir "$id")
   [[ -f "$dir/audio.wav" ]] || die "no audio.wav in $dir"
   have voxtype || die "voxtype not installed"
@@ -2026,9 +2096,9 @@ cmd_transcribe() {
   # earlier it led every later failure's message, and a chained download's
   # notification (first stderr line only) showed it instead of the error.
   local langwarn=""
-  [[ "$model" == *.en && -n "$lang" && "$lang" != "en" ]] \
+  [[ "$engine" == whisper && "$model" == *.en && -n "$lang" && "$lang" != "en" ]] \
     && langwarn="omarecorder: warning: $model only understands English, so language $lang has no effect; Accurate (large-v3-turbo) handles other languages"
-  if ! model_installed "$model"; then
+  if ! model_installed_for "$engine" "$model"; then
     if (( dl )); then
       # All the recording validations above already passed, so the intent is
       # sound; park it on the download job and let _dl_worker fire it.
@@ -2049,6 +2119,7 @@ cmd_transcribe() {
     fi
     exit 3
   fi
+  voxtype_configure "$engine" "$model" "$lang" || die "could not configure Voxtype for engine $engine and model $model"
   local unit="omarecorder-tx-$id"
   with_lock _claim_tx "$id" --arg id "$id" --arg m "$model" --arg u "$unit" --argjson t "$(now_epoch)" \
     '.jobs += [{type:"transcribe", id:$id, model:$m, unit:$u, started_at:$t}]' \
@@ -2058,7 +2129,7 @@ cmd_transcribe() {
   # the direct CHUNK_S assignment covers the inline (OMARECORDER_SYNC=1) path,
   # where the global was evaluated at script load.
   if [[ -n "$chunk_s" ]]; then export OMARECORDER_CHUNK_S="$chunk_s"; CHUNK_S="$chunk_s"; fi
-  if ! run_detached "$unit" "OmaRecorder transcribe $id" "$SELF" _tx-worker "$id" "$model" "$lang" "$threads" "$from" "$to" "$enhance"; then
+  if ! run_detached "$unit" "OmaRecorder transcribe $id" "$SELF" _tx-worker "$id" "$engine" "$model" "$lang" "$threads" "$from" "$to" "$enhance"; then
     state_set --arg id "$id" '.jobs |= map(select(.id != $id))'
     die "could not start transcription job"
   fi
@@ -2141,7 +2212,12 @@ enhance_audio() {
 }
 
 _tx_worker() {
-  local id="$1" model="$2" lang="$3" threads="$4" from="$5" to="$6" enhance="${7:-false}"
+  local id engine model lang threads from to enhance
+  if (( $# == 6 )); then
+    id="$1"; engine=whisper; model="$2"; lang="$3"; threads="$4"; from="$5"; to="$6"; enhance=false
+  else
+    id="$1"; engine="$2"; model="$3"; lang="$4"; threads="$5"; from="$6"; to="$7"; enhance="${8:-false}"
+  fi
   local dir; dir=$(require_dir "$id")
   local ttl; ttl=$(jq -r '.title // empty' "$dir/meta.json"); ttl="${ttl:-$id}"
   local acc="$dir/transcript.md.tmp" errlog="$RUN_DIR/tx-$id.err" child="" start done_audio=0
@@ -2182,8 +2258,13 @@ _tx_worker() {
       log "enhance failed for $id; transcribing the original audio"
     fi
   fi
-  local -a opts=(--model "$model" --language "$lang")
-  [[ "$threads" =~ ^[1-9][0-9]*$ ]] && opts+=(--threads "$threads")
+  # Voxtype 1.1 reads engine/model from its config; unlike older releases its
+  # transcribe command does not accept --model or --language overrides.
+  voxtype_configure "$engine" "$model" "$lang" || {
+    state_set --arg id "$id" '.jobs |= map(select(.id != $id))' || true
+    notify "Transcription failed · $ttl" "could not configure Voxtype for $engine/$model"
+    return 0
+  }
   local -a plan; mapfile -t plan < <(plan_chunks "$input" "$dur")
   local n=${#plan[@]} i=0 piece s e cwav="$input" ctxt="$RUN_DIR/tx-$id.chunk.txt" rc=0 prev_kept=0 why=""
   # mapfile hides a failed planner (process substitution): an empty plan must
@@ -2200,7 +2281,7 @@ _tx_worker() {
       ffmpeg -v error -y -ss "$s" -to "$e" -i "$input" -c copy "$cwav" || { rc=1; break; }
     fi
     # whisper's stderr goes to a per-job file (it can echo decoded text), not the shared log.
-    voxtype -q "${opts[@]}" transcribe "$cwav" 2>"$errlog" | awk 'seen{print} /^$/{seen=1}' > "$ctxt" &
+    voxtype -q transcribe "$cwav" 2>"$errlog" | awk 'seen{print} /^$/{seen=1}' > "$ctxt" &
     child=$!; wait "$child" || rc=1; child=""
     (( rc == 0 )) || break
     if grep -q '[^[:space:]]' "$ctxt"; then cat "$ctxt" >> "$acc"; printf '\n' >> "$acc"; fi
@@ -2247,10 +2328,11 @@ _tx_worker() {
 }
 # publish_transcript <dir> <body> <model> <lang> <from> <to> <chunks> <partial> [enhanced]: header + body → transcript.md (atomic)
 publish_transcript() {
-  local dir="$1" body="$2" model="$3" lang="$4" from="$5" to="$6" chunks="$7" partial="$8" enhanced="${9:-false}" ptag=""
+  local dir="$1" body="$2" model="$3" lang="$4" from="$5" to="$6" chunks="$7" partial="$8" enhanced="${9:-false}" ptag="" engine
+  engine=$(cfg engine)
   [[ "$partial" == "true" ]] && ptag=" partial=true"
   [[ "$enhanced" == "true" ]] && ptag="$ptag enhanced=true"
-  { printf '<!-- omarecorder model=%s language=%s created=%s range=%s-%s chunks=%s%s -->\n' "$model" "$lang" "$(now_iso)" "${from:-0}" "${to:-end}" "$chunks" "$ptag"
+  { printf '<!-- omarecorder engine=%s model=%s language=%s created=%s range=%s-%s chunks=%s%s -->\n' "$engine" "$model" "$lang" "$(now_iso)" "${from:-0}" "${to:-end}" "$chunks" "$ptag"
     cat "$body"; } > "$dir/transcript.md.new"
   mv -f "$dir/transcript.md.new" "$dir/transcript.md"
 }

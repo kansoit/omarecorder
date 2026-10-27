@@ -14,7 +14,7 @@ Item {
   readonly property var cfg: svc ? svc.config : ({})
   // The popup's key catcher must stand down while a settings field is edited.
   readonly property bool editing: dirField.activeFocus || dictHeard.activeFocus || dictWritten.activeFocus
-    || modelDrop.popupOpen || langDrop.popupOpen || vaultDrop.popupOpen
+    || engineDrop.popupOpen || modelDrop.popupOpen || langDrop.popupOpen || vaultDrop.popupOpen
   property bool dictAddOpen: false
   property string dictStatus: ""
   property string dirStatus: ""
@@ -29,7 +29,7 @@ Item {
   signal cursorMoved(Item item)
   // A field or dropdown gave the keyboard back; the popup has to take it again.
   signal doneEditing()
-  readonly property var cursorItems: [modelDrop, langDrop, dirField].concat(vaultDrop.visible ? [vaultDrop] : [])
+  readonly property var cursorItems: [engineDrop, modelDrop, langDrop, dirField].concat(vaultDrop.visible ? [vaultDrop] : [])
     .concat([keepAwake, autoTx, enhance, dictEditButton, dictAddButton, dictPromptButton, dictPasteButton])
   function cursorOn(item) { return cursorActive && cursorItems[cursorIndex] === item }
   function resetCursor() { cursorActive = false; cursorIndex = -1; cursorMark.visible = false }
@@ -43,12 +43,12 @@ Item {
     if (!cursorActive || cursorIndex < 0 || cursorIndex >= cursorItems.length) return
     var item = cursorItems[cursorIndex]
     if (item === dirField) { dirField.forceActiveFocus(); dirField.selectAll() }
-    else if (item === modelDrop || item === langDrop || item === vaultDrop) item.open()
+    else if (item === engineDrop || item === modelDrop || item === langDrop || item === vaultDrop) item.open()
     else item.clicked()
   }
   readonly property var installedModels: {
     var out = []
-    var ms = svc ? svc.models : []
+    var ms = svc ? svc.engineModels(root.cfg.engine || root.svc.defaultEngine) : []
     for (var i = 0; i < ms.length; i++) if (ms[i].installed) out.push({ value: ms[i].name, label: (ms[i].label ? ms[i].label + " · " : "") + ms[i].name })
     return out
   }
@@ -86,11 +86,30 @@ Item {
     PanelSectionHeader { text: "SETTINGS"; foreground: root.foreground; fontFamily: root.fontFamily }
 
     Dropdown {
+      id: engineDrop
+      hasCursor: root.cursorOn(engineDrop)
+      onPopupOpenChanged: if (!popupOpen) root.doneEditing()
+      width: parent.width; label: "Engine"
+      value: root.cfg.engine || (root.svc ? root.svc.defaultEngine : "whisper")
+      options: root.svc ? root.svc.engines : [{ value: "whisper", label: "Whisper" }]
+      foreground: root.foreground; fontFamily: root.fontFamily
+      onChanged: function(v) {
+        if (!root.svc) return
+        root.svc.setConfig("engine", v, function(code) {
+          if (code === 0) {
+            var first = root.svc.firstModel(v)
+            if (first) root.svc.setConfig("defaultModel", first)
+          }
+        })
+      }
+    }
+
+    Dropdown {
       id: modelDrop
       hasCursor: root.cursorOn(modelDrop)
       onPopupOpenChanged: if (!popupOpen) root.doneEditing()
       width: parent.width; label: "Default model"
-      value: root.cfg.defaultModel || "base.en"
+      value: root.cfg.defaultModel || (root.svc ? root.svc.firstModel(root.cfg.engine || root.svc.defaultEngine) : "base.en")
       options: root.installedModels.length ? root.installedModels : [{ value: root.cfg.defaultModel || "base.en", label: root.cfg.defaultModel || "base.en" }]
       foreground: root.foreground; fontFamily: root.fontFamily
       onChanged: function(v) { if (root.svc) root.svc.setConfig("defaultModel", v) }
@@ -102,6 +121,7 @@ Item {
       width: parent.width; label: "Language"
       value: root.cfg.language || "en"
       options: {
+        if (root.cfg.engine && root.cfg.engine !== "whisper") return [{ value: "auto", label: "Auto-detect (engine selected)" }]
         var o = [
           { value: "en", label: "English" },
           { value: "auto", label: "Auto-detect" },
@@ -148,7 +168,7 @@ Item {
       }
       Timer { id: dirStatusClear; interval: 8000; onTriggered: root.dirStatus = "" }
     }
-    Dropdown {
+    VaultPicker {
       // Only offered when Obsidian has vaults on this machine; "" = the CLI picks the open vault.
       id: vaultDrop
       hasCursor: root.cursorOn(vaultDrop)

@@ -73,6 +73,7 @@ QtObject {
   // The tidy pass flagged a long whisper repetition loop (policy lives in the CLI).
   function isLoopy(rec) { return !!(rec && rec.transcript && rec.transcript.tidy && rec.transcript.tidy.loop_warning) }
   readonly property string activeJobTitle: activeJob ? (recordingById(activeJob.id) ? displayTitle(recordingById(activeJob.id)) : activeJob.id) : ""
+  readonly property string defaultEngine: config && config.engine ? config.engine : "whisper"
   readonly property string defaultModel: config && config.defaultModel ? config.defaultModel : "base.en"
   // A source picked with `c` or the dropdown counts at once. The config write
   // and reload behind it take a moment, and `c` then `r` inside that moment
@@ -122,6 +123,23 @@ QtObject {
   function downloadFor(model) { for (var i = 0; i < jobs.length; i++) if (jobs[i].type === "download" && jobs[i].model === model) return jobs[i]; return null }
   function recordingById(id) { for (var i = 0; i < recordings.length; i++) if (recordings[i].id === id) return recordings[i]; return null }
   function modelByName(name) { for (var i = 0; i < models.length; i++) if (models[i].name === name) return models[i]; return null }
+  function engineModels(engine) { return models.filter(function(m) { return m.engine === engine }) }
+  readonly property var engines: {
+    var seen = {}, out = [], active = defaultEngine
+    for (var i = 0; i < models.length; i++) {
+      var e = models[i].engine
+      if (!e || seen[e]) continue
+      seen[e] = true
+      out.push({ value: e, label: e.charAt(0).toUpperCase() + e.slice(1) })
+    }
+    if (!seen[active]) out.unshift({ value: active, label: active.charAt(0).toUpperCase() + active.slice(1) })
+    return out
+  }
+  function firstModel(engine) {
+    var ms = engineModels(engine)
+    for (var i = 0; i < ms.length; i++) if (ms[i].installed) return ms[i].name
+    return ms.length ? ms[0].name : ""
+  }
   // The preset's name as the chips say it (Fast, Balanced, Accurate), else the engine's.
   function modelLabel(name) { var m = modelByName(name); return m && m.label ? m.label : (name || "") }
   function estimateSeconds(durationS, modelName) {

@@ -10,7 +10,7 @@ import "state.js" as State
 Item {
   id: root
   property var svc: null
-  property var models: svc ? svc.models : []
+  property var models: svc ? svc.engineModels(svc.defaultEngine) : []
   property string value: svc ? svc.defaultModel : "base.en"
   property real durationS: 0
   property color foreground: Color.foreground
@@ -79,7 +79,8 @@ Item {
       var m = models[i]
       if (!m.label) continue
       var extra = m.installed ? estimateText(m) : sizeText(m)
-      // Fast and Balanced are whisper's .en models; say so where the name is.
+      // Whisper's .en suffix is still useful context; other engines publish
+      // their language coverage through Voxtype rather than this picker.
       var name = m.name + (State.englishOnly(m.name) ? " · English only" : "")
       if (compact) opts.push({ value: m.name, label: m.label, tooltip: name + (extra ? " · " + extra : "") })
       else opts.push({ value: m.name, label: fullLabel(m), tooltip: name })
