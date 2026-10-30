@@ -1883,22 +1883,21 @@ model_label() {
 model_rtf() {
   local m="$1" v=""
   [[ -f "$BENCH_FILE" ]] && v=$(jq -r --arg m "$(cfg engine):$m" '.[$m].rtf // empty' "$BENCH_FILE" 2>/dev/null)
-  [[ -n "$v" ]] || [[ -f "$BENCH_FILE" ]] && v=$(jq -r --arg m "$m" '.[$m].rtf // empty' "$BENCH_FILE" 2>/dev/null)
+  if [[ -z "$v" && -f "$BENCH_FILE" ]]; then v=$(jq -r --arg m "$m" '.[$m].rtf // empty' "$BENCH_FILE" 2>/dev/null); fi
   [[ -n "$v" ]] && { echo "$v"; return 0; }
   v=$(jq -r --arg e "$(cfg engine)" --arg m "$m" '.[] | select(.engine==$e and .name==$m) | .rtf // empty' <<<"$(model_catalog_json)")
   echo "${v:-3}"
 }
-# Voxtype 1.1 keeps engine/model/language in its resolved config; the
-# transcribe subcommand intentionally does not accept --model/--language.
-# Apply OmaRecorder's selected engine before starting a job. Parakeet and the
-# other ONNX engines do not use Whisper's language setting.
-voxtype_configure() {
+# The engine, model and language of one transcription, as voxtype's global
+# options (one per line). They apply to that run only: Voxtype's own config,
+# which Omarchy's dictation also reads, is never changed. A Whisper model name
+# alone only sets the [whisper] model, so --engine always goes with it.
+# Parakeet and the other ONNX engines do not use Whisper's language setting.
+voxtype_run_args() {
   local engine="$1" model="$2" lang="${3:-auto}"
-  have voxtype || return 0
-  voxtype config set engine "$engine" >/dev/null 2>&1 || return 1
-  voxtype config set "$engine.model" "$model" >/dev/null 2>&1 || return 1
+  printf '%s\n' --engine "$engine" --model "$model"
   case "$engine" in
-    whisper|sensevoice|cohere) voxtype config set "$engine.language" "$lang" >/dev/null 2>&1 || return 1 ;;
+    whisper|sensevoice|cohere) printf '%s\n' --language "$lang" ;;
   esac
 }
 cmd_models() {
@@ -1988,12 +1987,12 @@ run_detached() {
 _dl_worker() {
   local engine name b; local f
   if (( $# == 1 )); then engine=whisper; name="$1"; else engine="$1"; name="$2"; fi
-  f="$VOXTYPE_MODELS_DIR/$name"
+  # Whisper models are single ggml-<name>.bin files; the other engines
+  # download a directory named after the model.
+  if [[ "$engine" == whisper ]]; then f="$VOXTYPE_MODELS_DIR/ggml-$name.bin"; else f="$VOXTYPE_MODELS_DIR/$name"; fi
   # model cancel stops the unit and owns the job removal; a TERM here is a
   # clean exit, not a failure (mirrors _tx_worker's trap contract).
   trap 'exit 0' TERM INT HUP
-  voxtype config set engine "$engine" >>"$LOG_FILE" 2>&1 || true
-  voxtype config set "$engine.model" "$name" >>"$LOG_FILE" 2>&1 || true
   voxtype setup --download --model "$name" --quiet --no-post-install >>"$LOG_FILE" 2>&1 &
   local child=$!
   # Progress = bytes on disk, published into the job entry every 2 s (the UI
@@ -2119,7 +2118,6 @@ cmd_transcribe() {
     fi
     exit 3
   fi
-  voxtype_configure "$engine" "$model" "$lang" || die "could not configure Voxtype for engine $engine and model $model"
   local unit="omarecorder-tx-$id"
   with_lock _claim_tx "$id" --arg id "$id" --arg m "$model" --arg u "$unit" --argjson t "$(now_epoch)" \
     '.jobs += [{type:"transcribe", id:$id, model:$m, unit:$u, started_at:$t}]' \
@@ -2258,13 +2256,8 @@ _tx_worker() {
       log "enhance failed for $id; transcribing the original audio"
     fi
   fi
-  # Voxtype 1.1 reads engine/model from its config; unlike older releases its
-  # transcribe command does not accept --model or --language overrides.
-  voxtype_configure "$engine" "$model" "$lang" || {
-    state_set --arg id "$id" '.jobs |= map(select(.id != $id))' || true
-    notify "Transcription failed · $ttl" "could not configure Voxtype for $engine/$model"
-    return 0
-  }
+  local -a opts; mapfile -t opts < <(voxtype_run_args "$engine" "$model" "$lang")
+  [[ "$threads" =~ ^[1-9][0-9]*$ ]] && opts+=(--threads "$threads")
   local -a plan; mapfile -t plan < <(plan_chunks "$input" "$dur")
   local n=${#plan[@]} i=0 piece s e cwav="$input" ctxt="$RUN_DIR/tx-$id.chunk.txt" rc=0 prev_kept=0 why=""
   # mapfile hides a failed planner (process substitution): an empty plan must
@@ -2281,14 +2274,14 @@ _tx_worker() {
       ffmpeg -v error -y -ss "$s" -to "$e" -i "$input" -c copy "$cwav" || { rc=1; break; }
     fi
     # whisper's stderr goes to a per-job file (it can echo decoded text), not the shared log.
-    voxtype -q transcribe "$cwav" 2>"$errlog" | awk 'seen{print} /^$/{seen=1}' > "$ctxt" &
+    voxtype -q "${opts[@]}" transcribe "$cwav" 2>"$errlog" | awk 'seen{print} /^$/{seen=1}' > "$ctxt" &
     child=$!; wait "$child" || rc=1; child=""
     (( rc == 0 )) || break
     if grep -q '[^[:space:]]' "$ctxt"; then cat "$ctxt" >> "$acc"; printf '\n' >> "$acc"; fi
     done_audio=$(awk -v a="$done_audio" -v s="$s" -v e="$e" 'BEGIN{print a + (e - s)}')
     if (( prev_kept == 0 )); then [[ -f "$dir/transcript.md" ]] && cp -f "$dir/transcript.md" "$dir/transcript.prev.md"; prev_kept=1; fi
     if (( i < n )); then   # publish what we have so far; the Library shows it growing
-      publish_transcript "$dir" "$acc" "$model" "$lang" "$from" "$to" "$n" true "$enhanced"
+      publish_transcript "$dir" "$acc" "$model" "$lang" "$from" "$to" "$n" true "$enhanced" "$engine"
       tidy_transcript "$dir"
       update_meta "$dir" '.transcript = ((.transcript // {}) + {model:$m, language:$l, created:$c, partial:true, chunks:$N, chunks_done:$i, chunk_s:$k, enhanced:$E})' \
         --arg m "$model" --arg l "$lang" --arg c "$(now_iso)" --argjson N "$n" --argjson i "$i" --argjson k "$CHUNK_S" --argjson E "$enhanced"
@@ -2300,7 +2293,7 @@ _tx_worker() {
     [[ -n "$why" ]] || why=$(grep -iE 'error|failed|cannot|not found' "$errlog" 2>/dev/null | tail -1 | cut -c1-120)
     mkdir -p "$STATE_DIR"; mv -f "$errlog" "$STATE_DIR/tx-$id.err" 2>/dev/null || true
     if (( i > 1 )) && [[ -s "$acc" ]]; then   # some pieces made it: keep them, say so
-      publish_transcript "$dir" "$acc" "$model" "$lang" "$from" "$to" "$n" true "$enhanced"
+      publish_transcript "$dir" "$acc" "$model" "$lang" "$from" "$to" "$n" true "$enhanced" "$engine"
       tidy_transcript "$dir"
       notify "Transcription stopped after $((i - 1))/$n pieces · $ttl" "${why:-voxtype failed}. The finished pieces are kept (details: $STATE_DIR/tx-$id.err)"
     else
@@ -2311,7 +2304,7 @@ _tx_worker() {
   rm -f "$errlog"
   local elapsed; elapsed=$(awk -v s="$start" -v e="$(date +%s.%N)" 'BEGIN{d=e-s; if(d<0.1)d=0.1; printf "%.1f", d}')
   grep -q '[^[:space:]]' "$acc" || printf '(no speech detected)\n' > "$acc"
-  publish_transcript "$dir" "$acc" "$model" "$lang" "$from" "$to" "$n" false "$enhanced"
+  publish_transcript "$dir" "$acc" "$model" "$lang" "$from" "$to" "$n" false "$enhanced" "$engine"
   rm -f "$acc"
   learn_rtf "$model" "$done_audio" "$elapsed"
   local rtf; rtf=$(jq -n --argjson d "$done_audio" --argjson e "$elapsed" '(($d / $e) * 100 | round) / 100')
@@ -2326,10 +2319,10 @@ _tx_worker() {
   [[ "$enh_skipped" == true ]] && ready_note+=" Audio cleanup failed, so the original audio was transcribed."
   notify "Transcript ready · $ttl" "$ready_note Click to open" -- "$SELF" open "$id"
 }
-# publish_transcript <dir> <body> <model> <lang> <from> <to> <chunks> <partial> [enhanced]: header + body → transcript.md (atomic)
+# publish_transcript <dir> <body> <model> <lang> <from> <to> <chunks> <partial> [enhanced] [engine]: header + body → transcript.md (atomic)
 publish_transcript() {
-  local dir="$1" body="$2" model="$3" lang="$4" from="$5" to="$6" chunks="$7" partial="$8" enhanced="${9:-false}" ptag="" engine
-  engine=$(cfg engine)
+  local dir="$1" body="$2" model="$3" lang="$4" from="$5" to="$6" chunks="$7" partial="$8" enhanced="${9:-false}" ptag=""
+  local engine="${10:-$(cfg engine)}"
   [[ "$partial" == "true" ]] && ptag=" partial=true"
   [[ "$enhanced" == "true" ]] && ptag="$ptag enhanced=true"
   { printf '<!-- omarecorder engine=%s model=%s language=%s created=%s range=%s-%s chunks=%s%s -->\n' "$engine" "$model" "$lang" "$(now_iso)" "${from:-0}" "${to:-end}" "$chunks" "$ptag"

@@ -132,6 +132,7 @@ FAKEPATH="$FAKEAUDIO:$PATH"
 STUB="$TMP/voxstub"; mkdir -p "$STUB"          # success: writes the model file; transcribes to stub text
 cat > "$STUB/voxtype" <<STUBEOF
 #!/bin/bash
+case "\$1" in info|config) exit 1 ;; esac
 # setup --download writes the model file; anything else is the transcribe
 # call (voxtype -q --model ... transcribe FILE), which emits text after a
 # blank line the way the real engine does.
@@ -189,6 +190,8 @@ MODELSOK="$TMP/modelsok"; mkdir -p "$MODELSOK"; head -c 100 /dev/zero > "$MODELS
 STUBMODE="$TMP/voxmode"; mkdir -p "$STUBMODE"
 cat > "$STUBMODE/voxtype" <<'STUBEOF'
 #!/bin/bash
+case "$1" in info|config) exit 1 ;; esac
+[ -n "${VOXSTUB_ARGS:-}" ] && printf '%s\n' "$@" > "$VOXSTUB_ARGS"
 if [ "$1" = setup ]; then
   [ "${VOXSTUB_MODE:-ok}" = dlhang ] && exec sleep 600
   for a in "$@"; do case "$a" in --model) m=next ;; *) [ "${m:-}" = next ] && { m="$a"; break; } ;; esac; done
@@ -720,7 +723,10 @@ jq -c '.transcript = {model:"base.en"}' "$DT/meta.json" > "$DT/meta.json.t" && m
 $CLI trim "$IDT" --from 0 --to 2 >/dev/null
 eq "trim marks the transcript stale" "$(jq -r .transcript.stale "$DT/meta.json")" "true"
 eq "and says why (the Library words its note from it)" "$(jq -r .transcript.stale_reason "$DT/meta.json")" "trim"
-check "transcribe after trim" env PATH="$STUBMODE:$PATH" VOXTYPE_MODELS_DIR="$MODELSOK" "$CLI" transcribe "$IDT" --model base.en
+check "transcribe after trim" env VOXSTUB_ARGS="$TMP/vox.args" PATH="$STUBMODE:$PATH" VOXTYPE_MODELS_DIR="$MODELSOK" "$CLI" transcribe "$IDT" --model base.en
+# The engine, model and language go to voxtype per run; its own config (which
+# Omarchy's dictation reads) is never rewritten.
+eq "transcribe passes the engine, model and language per run" "$(paste -sd' ' "$TMP/vox.args")" "-q --engine whisper --model base.en --language en transcribe $DT/audio.wav"
 eq "new transcript clears stale" "$(jq -r '.transcript.stale // "absent"' "$DT/meta.json")" "absent"
 eq "stale set again by --restore" "$($CLI trim "$IDT" --restore >/dev/null; jq -r .transcript.stale "$DT/meta.json")" "true"
 eq "with restore as the reason" "$(jq -r .transcript.stale_reason "$DT/meta.json")" "restore"
@@ -881,7 +887,7 @@ check "prompt defuses its own placeholder" bash -c "\"$CLI\" dictionary prompt |
 IDX=$("$CLI" import "$TMP/quiet.wav" --title "Hint Test")
 # The hint comes after the engine check, so a stand-in voxtype keeps this honest where the real one is absent (CI).
 mkdir -p "$TMP/voxok"; printf '#!/bin/sh\nexit 0\n' > "$TMP/voxok/voxtype"; chmod +x "$TMP/voxok/voxtype"
-check "bogus model hint does not suggest an impossible download" bash -c "OUT=\$(PATH=\"$TMP/voxok:\$PATH\" VOXTYPE_MODELS_DIR=\"$TMP/nomodels\" \"$CLI\" transcribe '$IDX' --model bogus 2>&1); ! grep -q 'model download bogus' <<<\"\$OUT\" && grep -q 'not in the catalog' <<<\"\$OUT\""
+check "bogus model hint does not suggest an impossible download" bash -c "OUT=\$(PATH=\"$TMP/voxok:\$PATH\" VOXTYPE_MODELS_DIR=\"$TMP/nomodels\" \"$CLI\" transcribe '$IDX' --model bogus 2>&1); ! grep -q 'model download bogus' <<<\"\$OUT\" && grep -qE 'not in the catalog|unknown model: bogus' <<<\"\$OUT\""
 "$CLI" delete "$IDX" --yes >/dev/null
 printf '# emptied by the test suite\n' > "$DICT"
 
@@ -1983,7 +1989,7 @@ for tool in xdg-open omarchy-launch-editor omarchy-shell; do
   printf '#!/bin/bash\nprintf "%%s\\n" "$@" > "%s/%s.args"\n' "$EX" "$tool" > "$EX/$tool"; chmod +x "$EX/$tool"
 done
 eq "dictionary edit prints the file" "$(PATH="$EX:$PATH" "$CLI" dictionary edit)" "$XDG_CONFIG_HOME/omarecorder/dictionary"
-check "and hands it to xdg-open" wait_for 3 grep -qx "$XDG_CONFIG_HOME/omarecorder/dictionary" "$EX/xdg-open.args"
+check "and hands it to the Omarchy editor, like open does" wait_for 3 grep -qx "$XDG_CONFIG_HOME/omarecorder/dictionary" "$EX/omarchy-launch-editor.args"
 # The editor gets a path through a private link named by the id: the folder's
 # title never reaches the terminal's command line.
 check "open hands the transcript to the editor" env PATH="$EX:$PATH" "$CLI" open "$IDS"
